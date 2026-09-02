@@ -1,0 +1,1459 @@
+// Canvas interaction: pan, zoom, selection, dragging and the right-click menu.
+
+import { $, clone } from './util.js';
+import {
+  state, mutate, tableById, relationshipById, annotationById, subscribe,
+  clearSelection, selectOnly, toggleSelection, notify, removeTable, removeRelationship, removeAnnotation,
+  newAnnotation, annotationKind
+} from './state.js';
+import { render, routeFor, MIN_NOTE_WIDTH, MIN_NOTE_HEIGHT } from './render.js';
+import {
+  measureTable, tableRect, distanceToPolyline, rectsIntersect, annotationRect, annotationBounds,
+  documentBounds, stickyTilt
+} from './geometry.js';
+
+const MIN_ZOOM = 0.15;
+const MAX_ZOOM = 3;
+
+/** Zoom buttons and keyboard shortcuts move in whole 5% steps from 100%. */
+const ZOOM_STEP = 0.05;
+
+let canvas = null;
+let host = null;
+let onSelectionChange = () => {};
+let onContextMenu = () => {};
+let onOpenEditor = () => {};
+let onConnect = () => {};
+let onAnnotationPlaced = () => {};
+
+const drag = {
+  mode: null,
+  startScreen: null,
+  startWorld: null,
+  origin: null,
+  moved: false,
+  spaceHeld: false,
+  button: 0,
+  routeId: null,
+  routeAxis: 'x',
+  resizeId: null
+};
+
+/** Set when a right-button drag panned the canvas, so the drag does not also open a menu. */
+let suppressContextMenu = false;
+
+/**
+ * A contextmenu event that arrived while the right button was still down. Chromium fires
+ * contextmenu on release under Windows and on press elsewhere, so the menu is always held until
+ * the button comes up and it is clear whether the gesture was a click or a pan.
+ */
+let pendingMenu = null;
+
+export function initInteractions(handlers) {
+  canvas = document.getElementById('canvas');
+  host = document.getElementById('canvas-host');
+
+  onSelectionChange = handlers.onSelectionChange || onSelectionChange;
+  onContextMenu = handlers.onContextMenu || onContextMenu;
+  onOpenEditor = handlers.onOpenEditor || onOpenEditor;
+  onConnect = handlers.onConnect || onConnect;
+  onAnnotationPlaced = handlers.onAnnotationPlaced || onAnnotationPlaced;
+
+  canvas.addEventListener('pointerdown', onPointerDown);
+  canvas.addEventListener('pointermove', onPointerMove);
+  canvas.addEventListener('pointerup', onPointerUp);
+  canvas.addEventListener('pointercancel', onPointerUp);
+  canvas.addEventListener('wheel', onWheel, { passive: false });
+  canvas.addEventListener('contextmenu', onCanvasContextMenu);
+  canvas.addEventListener('dblclick', onDoubleClick);
+
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+
+  // Space held down is a modifier, and a modifier the window cannot see released is a modifier
+  // stuck on: hold Space, Alt+Tab away, let go over another window, come back, and a plain
+  // left-drag panned instead of drawing a marquee until Space was pressed and released again.
+  window.addEventListener('blur', onWindowBlur);
+
+  // Connect mode holds a table id from the current document. Opening another diagram while it is
+  // armed would leave the banner naming a table that no longer exists, and the next click would
+  // try to connect that ghost to whatever was clicked.
+  subscribe(reason => {
+    if (reason !== 'document-replacing') return;
+    endConnectMode();
+    endDrawMode();
+
+    // Same reasoning: an open note names a table in the document being replaced.
+    state.openNote = null;
+
+    // And the drag in flight belongs to the document that has just gone. Dropped rather than put
+    // back, because this notification is raised *after* the swap - every id in it now resolves
+    // against the new document, or against nothing. Left alone, the release at the end of the
+    // gesture committed against whatever had arrived: opening a file mid-drag pushed an undo entry
+    // and marked the new diagram dirty before the user had touched it.
+    forgetDrag();
+  });
+
+  // A dialog is about to cover the canvas, so any mode waiting for the next click on that canvas
+  // is over. Left armed, the mode's banner floated on top of the dialog - it is appended to the
+  // body after the modal root at the same z-index, so it wins - telling the user to click a canvas
+  // they could no longer reach, and Escape then closed the dialog rather than the mode.
+  //
+  // An event rather than ui.js importing this module: ui.js is the layer underneath, and the
+  // dependency the other way round is what would make a cycle out of it later.
+  window.addEventListener('dmd:modal-opened', () => {
+    // Read before ending anything: endDrawMode clears pendingArrow itself, so testing it
+    // afterwards was always false and the half-drawn preview stayed painted on the canvas until
+    // something else happened to redraw it.
+    const wasActive = isConnecting() || isDrawing() || !!state.pendingArrow || !!drag.mode;
+
+    endConnectMode();
+    endDrawMode();
+
+    // A drag in flight is abandoned, not finished. Nulling the mode used to be the whole of it,
+    // which meant onPointerUp returned early and the live geometry the drag had already written
+    // stayed on the object with no undo entry behind it and without the diagram being marked
+    // dirty. For a rotation that is worse than for the others, because the drag *creates* a
+    // property the note did not have - so a note nobody had turned was left carrying the slant the
+    // canvas had only been deriving, and the draw.io export then treats that as a chosen angle.
+    abandonDrag();
+
+    if (wasActive) render();
+  });
+}
+
+// ------------------------------------------------------------ coordinates --
+
+export function toWorld(clientX, clientY) {
+  const box = canvas.getBoundingClientRect();
+  return {
+    x: (clientX - box.left - state.view.panX) / state.view.zoom,
+    y: (clientY - box.top - state.view.panY) / state.view.zoom
+  };
+}
+
+export function toScreen(worldX, worldY) {
+  const box = canvas.getBoundingClientRect();
+  return {
+    x: worldX * state.view.zoom + state.view.panX + box.left,
+    y: worldY * state.view.zoom + state.view.panY + box.top
+  };
+}
+
+// -------------------------------------------------------------- hit test --
+
+/**
+ * The table whose card is under a screen point, ignoring whatever is painted on top of it.
+ *
+ * Only connect mode needs this: everywhere else the topmost thing is genuinely what was clicked.
+ * Walked backwards so the last card drawn - the one on top where two overlap - wins, which is the
+ * same answer the browser's own hit test would give.
+ */
+function tableUnder(event) {
+  const world = toWorld(event.clientX, event.clientY);
+  const tables = state.doc.tables;
+
+  for (let i = tables.length - 1; i >= 0; i--) {
+    const rect = tableRect(tables[i]);
+    if (world.x >= rect.x && world.x <= rect.x + rect.width &&
+        world.y >= rect.y && world.y <= rect.y + rect.height) {
+      return tables[i].id;
+    }
+  }
+
+  return null;
+}
+
+function hitTest(event) {
+  const target = event.target.closest('[data-kind]');
+  if (target) {
+    return { kind: target.getAttribute('data-kind'), id: target.getAttribute('data-id') };
+  }
+
+  // Connectors are thin; check proximity as a fallback so near-misses still select.
+  const world = toWorld(event.clientX, event.clientY);
+  const threshold = 8 / state.view.zoom;
+
+  for (const relationship of state.doc.relationships) {
+    const route = routeFor(relationship.id);
+    if (!route) continue;
+    if (distanceToPolyline(world, route.points) <= threshold) {
+      return { kind: 'relationship', id: relationship.id };
+    }
+  }
+
+  return null;
+}
+
+// --------------------------------------------------------------- pointer --
+
+function onPointerDown(event) {
+  canvas.setPointerCapture(event.pointerId);
+
+  // Cleared where the gesture that sets it begins, not where it is consumed. It is set on the way
+  // up from a right-button pan and cleared inside the canvas contextmenu handler, so any pan that
+  // never produces a contextmenu on the canvas - Alt+Tab mid-drag, or releasing over a side panel,
+  // where pointer capture keeps pointerup here while contextmenu goes to the element under the
+  // cursor - used to leave it armed and silently swallow the next right-click.
+  suppressContextMenu = false;
+
+  drag.startScreen = { x: event.clientX, y: event.clientY };
+  drag.startWorld = toWorld(event.clientX, event.clientY);
+  drag.moved = false;
+  drag.button = event.button;
+
+  // A draw tool is armed, so the next click on the canvas means "put one here" rather than
+  // "select whatever is under the pointer". Checked before everything else for the same reason
+  // connect mode is: while a mode is on, the ordinary meaning of a click is suspended, and a mode
+  // that only half applies is worse than no mode at all.
+  if (isDrawing() && event.button === 0) {
+    const tool = state.draw.tool;
+
+    if (tool === 'arrow') {
+      drag.mode = 'draw-arrow';
+      drag.origin = { ink: state.draw.ink || null };
+      state.pendingArrow = {
+        x: drag.startWorld.x, y: drag.startWorld.y, dx: 0, dy: 0, ink: drag.origin.ink
+      };
+      render();
+      return;
+    }
+
+    drag.mode = null;
+    endDrawMode();
+    placeAnnotation(tool, drag.startWorld);
+    return;
+  }
+
+  // Right-click gets out of a draw mode rather than opening a menu inside it, and then falls
+  // through to the ordinary right-button pan below.
+  if (isDrawing() && event.button === 2) endDrawMode();
+
+  // The grab handles on the ends of a selected arrow. Before the resize grip below, which looks
+  // for a different attribute, and before the hit test, which would otherwise treat the handle as
+  // a click on the arrow itself and start a move.
+  //
+  // Not while connect mode is armed, for the same reason the NOTE tag is not: since 1.9.0 an
+  // annotation can be drawn in front of the cards, so "click the other table" can land on a handle
+  // belonging to something selected earlier - and reshaping an arrow instead of drawing the
+  // relationship leaves the banner up with nothing to show for the click.
+  if (event.button === 0 && event.target.closest && !isConnecting()) {
+    const endHandle = event.target.closest('[data-arrow-end]');
+    const startHandle = endHandle ? null : event.target.closest('[data-arrow-start]');
+    const handle = endHandle || startHandle;
+
+    if (handle) {
+      const annotation = annotationById(handle.getAttribute('data-id'));
+
+      if (annotation) {
+        drag.mode = endHandle ? 'arrow-end' : 'arrow-start';
+        drag.resizeId = annotation.id;
+        drag.origin = {
+          x: annotation.x, y: annotation.y,
+          dx: Number(annotation.dx) || 0, dy: Number(annotation.dy) || 0
+        };
+        return;
+      }
+    }
+  }
+
+  // The NOTE tag on a card, and the close cross on the note it opens. Both are inside groups that
+  // would otherwise be hit-tested as the table or as empty canvas, so they are checked first and
+  // the gesture ends here: no selection change, no drag, and clicking the tag again closes it.
+  //
+  // Not while connect mode is armed. The tag sits in the right-hand end of a card's header, so
+  // "click the other table to draw a relationship to it" would open a note instead whenever the
+  // click happened to land on it - leaving the banner up, no connector drawn, and the mode still
+  // armed for the next click somewhere else.
+  if (event.button === 0 && event.target.closest && !isConnecting()) {
+    const closer = event.target.closest('[data-note-close]');
+    if (closer) {
+      drag.mode = null;
+      state.openNote = null;
+      render();
+      return;
+    }
+
+    const tag = event.target.closest('[data-note-for]');
+    if (tag) {
+      drag.mode = null;
+      const id = tag.getAttribute('data-note-for');
+      state.openNote = state.openNote === id ? null : id;
+      render();
+      return;
+    }
+  }
+
+  // The rotation knob above a selected sticky note. Checked with the other controls drawn on the
+  // selection rather than after the hit test, because it stands over whatever is behind the note.
+  // Not while connecting, for the reason above.
+  if (event.button === 0 && !isConnecting()) {
+    const knob = event.target.closest ? event.target.closest('[data-rotate]') : null;
+    if (knob) {
+      const annotation = annotationById(knob.getAttribute('data-id'));
+      if (annotation) {
+        selectOnly('annotations', annotation.id);
+        render();
+        onSelectionChange();
+
+        // The note turns about the centre of its placed rectangle, which is what the renderer
+        // rotates it about, so that is where both angles are measured from.
+        const rect = annotationRect(annotation);
+        const centre = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+
+        drag.mode = 'rotate';
+        drag.resizeId = annotation.id;
+        drag.origin = {
+          // Where the note is standing now, derived slant included, so grabbing the knob does not
+          // snap an untouched note upright before the drag has moved anywhere.
+          tilt: stickyTilt(annotation),
+
+          // ...but whether that angle was ever *written* is a different question. If it was not,
+          // an abandoned drag has to leave the note with no tilt of its own rather than freezing
+          // the derived one into the file - see the commit in onPointerUp.
+          hadTilt: hasExplicitTilt(annotation),
+          centre,
+          pointer: angleAt(centre, drag.startWorld)
+        };
+
+        return;
+      }
+    }
+  }
+
+  // The corner grip on a note is checked before anything else, otherwise the note under it wins
+  // the hit test and the gesture becomes a move. Not while connecting, for the reason above.
+  if (event.button === 0 && !isConnecting()) {
+    const grip = event.target.closest ? event.target.closest('[data-resize]') : null;
+    if (grip) {
+      const annotation = annotationById(grip.getAttribute('data-id'));
+      if (annotation) {
+        selectOnly('annotations', annotation.id);
+        render();
+        onSelectionChange();
+
+        // Seeded from annotationRect rather than from the raw fields, so a note with no size on it
+        // - a hand-edited or pre-1.6.0 file - does not jump to a different size the moment the
+        // grip is grabbed.
+        const size = annotationRect(annotation);
+        const tilt = drawnTilt(annotation);
+        const centre = { x: size.x + size.width / 2, y: size.y + size.height / 2 };
+
+        drag.mode = 'resize';
+        drag.resizeId = annotation.id;
+        drag.origin = {
+          width: size.width, height: size.height,
+          x: annotation.x, y: annotation.y,
+          tilt,
+
+          // The corner diagonally opposite the grip, in world coordinates. A note is drawn rotated
+          // about the centre of its own rectangle, so growing it moves that centre and drags the
+          // far corner along with it; holding this point still is what makes the grip follow the
+          // pointer instead of half of it. At no tilt the arithmetic below collapses to what it
+          // has always been - the anchor is x,y and neither of them moves.
+          anchor: rotateAbout({ x: size.x, y: size.y }, centre, tilt)
+        };
+
+        return;
+      }
+    }
+  }
+
+  // Right-button drag pans the canvas. A right-click that does not move still opens the menu,
+  // which is why the menu is only suppressed once the pointer has actually travelled.
+  if (event.button === 2) {
+    drag.mode = 'pan';
+    drag.origin = { panX: state.view.panX, panY: state.view.panY };
+    canvas.classList.add('is-panning');
+    return;
+  }
+
+  const hit = hitTest(event);
+
+  // Connect mode: armed from a table's menu, then the next card clicked becomes the other end.
+  // Deliberately a mode rather than a modifier-drag - Alt-drag and Ctrl-drag already mean pan and
+  // fine-nudge, and a gesture nobody can discover is not a feature.
+  if (state.connect && state.connect.fromTableId) {
+    if (event.button !== 0) return;
+
+    // What the pointer landed on may not be what the user was pointing at. Since 1.9.0 an
+    // annotation is drawn in front of the cards by default, so a note sitting on a table - which is
+    // exactly where a note about that table goes - takes the click. Falling through from here
+    // selected the note, started dragging it, drew no relationship and left the mode armed with
+    // the banner still up: a click that did nothing anyone could see.
+    const target = hit && hit.kind === 'table' ? hit.id : tableUnder(event);
+
+    if (target && target !== state.connect.fromTableId) {
+      const from = state.connect.fromTableId;
+      endConnectMode();
+      onConnect(from, target);
+      return;
+    }
+
+    // Empty canvas gets out of the mode, which is the only cheap way out of it. Anything else -
+    // a connector, an annotation with no card under it, the source card itself - is left alone
+    // rather than being selected or dragged, so the next click can still be the other end.
+    if (!hit) {
+      endConnectMode();
+      return;
+    }
+
+    if (!target) return;
+  }
+
+  const isPanGesture = event.button === 1 || drag.spaceHeld || (!hit && event.altKey);
+
+  if (isPanGesture) {
+    drag.mode = 'pan';
+    drag.origin = { panX: state.view.panX, panY: state.view.panY };
+    canvas.classList.add('is-panning');
+    return;
+  }
+
+  if (!hit) {
+    drag.mode = 'marquee';
+    if (!event.shiftKey && !event.ctrlKey) {
+      clearSelection();
+      render();
+      onSelectionChange();
+    }
+    return;
+  }
+
+  const kind = hit.kind === 'table' ? 'tables'
+    : hit.kind === 'relationship' ? 'relationships' : 'annotations';
+
+  if (event.shiftKey || event.ctrlKey) {
+    toggleSelection(kind, hit.id);
+  } else if (!state.selection[kind].has(hit.id)) {
+    selectOnly(kind, hit.id);
+  }
+
+  render();
+  onSelectionChange();
+
+  if (hit.kind === 'relationship') {
+    const relationship = relationshipById(hit.id);
+    const route = routeFor(hit.id);
+
+    if (!relationship || !route) { drag.mode = null; return; }
+
+    drag.mode = 'route';
+    drag.routeId = hit.id;
+    drag.routeAxis = route.offsetAxis === 'y' ? 'y' : 'x';
+    drag.origin = { offset: Number(relationship.routeOffset) || 0 };
+    return;
+  }
+
+  drag.mode = 'move';
+  drag.origin = captureMovablePositions();
+}
+
+/**
+ * Ends the drag in flight and forgets it, without putting anything back.
+ *
+ * For the routes where the document itself has been replaced: the ids the drag is holding no
+ * longer name anything in it, so there is nothing to revert to and reverting would write into the
+ * wrong diagram.
+ */
+function forgetDrag() {
+  drag.mode = null;
+  drag.moved = false;
+  drag.origin = null;
+  drag.routeId = null;
+  drag.resizeId = null;
+
+  clearDragChrome('marquee');
+}
+
+/**
+ * The two things a drag paints outside the document: the marquee rectangle and the pan cursor.
+ *
+ * Neither is cleared by a redraw - the marquee is a sibling of the whole viewport rather than
+ * something inside a layer - so a gesture that ends anywhere other than onPointerUp leaves both
+ * standing. That is a rectangle drawn across the canvas until the next marquee finishes, and a
+ * grabbing cursor that outlives the pan.
+ */
+function clearDragChrome(mode) {
+  if (canvas) canvas.classList.remove('is-panning');
+  if (mode === 'marquee') hideMarquee();
+}
+
+/**
+ * Puts back whatever the drag in flight had already written, and ends it.
+ *
+ * Only the modes that write into the *document* as they go need reverting; a pan, a marquee or a
+ * gesture that never moved has nothing in the file to put back - but both of those still leave
+ * something painted on screen, which clearDragChrome takes care of for every mode.
+ */
+function abandonDrag() {
+  const mode = drag.mode;
+  drag.mode = null;
+
+  clearDragChrome(mode);
+
+  if (!mode || !drag.moved) { drag.resizeId = null; return; }
+
+  if (mode === 'route') {
+    const relationship = relationshipById(drag.routeId);
+    if (relationship) relationship.routeOffset = drag.origin.offset;
+    drag.routeId = null;
+    return;
+  }
+
+  if (mode === 'move') {
+    for (const entry of drag.origin || []) {
+      const target = entry.kind === 'table' ? tableById(entry.id) : annotationById(entry.id);
+      if (target) { target.x = entry.x; target.y = entry.y; }
+    }
+    return;
+  }
+
+  const annotation = annotationById(drag.resizeId);
+  drag.resizeId = null;
+  if (!annotation) return;
+
+  if (mode === 'resize') {
+    Object.assign(annotation, {
+      width: drag.origin.width, height: drag.origin.height,
+      x: drag.origin.x, y: drag.origin.y
+    });
+  } else if (mode === 'rotate') {
+    if (drag.origin.hadTilt) annotation.tilt = drag.origin.tilt;
+    else delete annotation.tilt;
+  } else if (mode === 'arrow-end' || mode === 'arrow-start') {
+    Object.assign(annotation, {
+      x: drag.origin.x, y: drag.origin.y, dx: drag.origin.dx, dy: drag.origin.dy
+    });
+  }
+}
+
+/**
+ * The frame a resize drag works in: the angle the user has *chosen* for this annotation, or none.
+ *
+ * Only a sticky note is ever turned, and only one turned by hand counts. The slight slant an
+ * untouched note is drawn with is decoration - derived from its id so that a wall of notes does
+ * not look like a grid - and nobody dragging the corner of one is thinking in its frame. Honouring
+ * it here would also make the arithmetic depend on which id the note happened to be given: at four
+ * degrees a 64-unit drag picks up five units of the other axis, which is enough to cross the
+ * eight-unit snap, so two notes would answer the same gesture differently.
+ *
+ * A note turned by hand is the opposite case. Its axes are where the user put them, and adding raw
+ * screen travel to a width measured along them grew the note away from the pointer - at a half
+ * turn the grip did not move at all, however far the drag went.
+ */
+function drawnTilt(annotation) {
+  return annotationKind(annotation) === 'note' && hasExplicitTilt(annotation)
+    ? stickyTilt(annotation)
+    : 0;
+}
+
+/** A vector in world coordinates, expressed in the frame of something turned by `degrees`. */
+function toLocal(x, y, degrees) {
+  const radians = (degrees || 0) * Math.PI / 180;
+  const cos = Math.cos(radians);
+  const sin = Math.sin(radians);
+
+  return { x: x * cos + y * sin, y: -x * sin + y * cos };
+}
+
+/** A point moved by a vector given in the frame of something turned by `degrees`. */
+function translate(point, vector, degrees) {
+  const radians = (degrees || 0) * Math.PI / 180;
+  const cos = Math.cos(radians);
+  const sin = Math.sin(radians);
+
+  return {
+    x: point.x + vector.x * cos - vector.y * sin,
+    y: point.y + vector.x * sin + vector.y * cos
+  };
+}
+
+/** A point turned about another point by `degrees`, the way the renderer turns a note. */
+function rotateAbout(point, centre, degrees) {
+  return translate(centre, { x: point.x - centre.x, y: point.y - centre.y }, degrees);
+}
+
+/**
+ * Asks the inspector to redraw itself.
+ *
+ * A drag writes straight onto the annotation, so the panel beside it keeps whatever it was built
+ * with - the Angle box read "Straight" on a note that had just been turned a quarter turn, and its
+ * list of angles did not contain the one the note was standing at, so there was no way to pick it
+ * back either. An event rather than an import: inspector.js imports this module, and the
+ * dependency the other way round would make a cycle out of it.
+ */
+function refreshInspectorSoon() {
+  window.dispatchEvent(new CustomEvent('dmd:refresh-inspector'));
+}
+
+/** Whether an annotation carries an angle of its own, as opposed to the one geometry.js derives. */
+export function hasExplicitTilt(annotation) {
+  return !!annotation && typeof annotation.tilt === 'number' && isFinite(annotation.tilt);
+}
+
+/** The angle from a centre point to another point, in degrees, positive clockwise. */
+function angleAt(centre, point) {
+  return Math.atan2(point.y - centre.y, point.x - centre.x) * 180 / Math.PI;
+}
+
+/**
+ * An angle folded back into [-180, 180).
+ *
+ * Applied to the *change* as well as to the result: a drag that crosses the point where atan2
+ * flips from 180 to -180 produces a delta of nearly 360 degrees, and without this the note span
+ * the long way round in one frame.
+ */
+export function wrapDegrees(degrees) {
+  const wrapped = ((degrees + 180) % 360 + 360) % 360 - 180;
+  return Object.is(wrapped, -0) ? 0 : wrapped;
+}
+
+function captureMovablePositions() {
+  const positions = [];
+
+  for (const id of state.selection.tables) {
+    const table = tableById(id);
+    if (table) positions.push({ kind: 'table', id, x: table.x, y: table.y });
+  }
+
+  for (const id of state.selection.annotations) {
+    const annotation = annotationById(id);
+    if (annotation) positions.push({ kind: 'annotation', id, x: annotation.x, y: annotation.y });
+  }
+
+  return positions;
+}
+
+function onPointerMove(event) {
+  if (!drag.mode) return;
+
+  const dx = event.clientX - drag.startScreen.x;
+  const dy = event.clientY - drag.startScreen.y;
+
+  if (!drag.moved && Math.hypot(dx, dy) < 3) return;
+  drag.moved = true;
+
+  if (drag.mode === 'pan') {
+    state.view.panX = drag.origin.panX + dx;
+    state.view.panY = drag.origin.panY + dy;
+    render();
+    return;
+  }
+
+  if (drag.mode === 'marquee') {
+    drawMarquee(drag.startScreen, { x: event.clientX, y: event.clientY });
+    return;
+  }
+
+  if (drag.mode === 'route') {
+    const relationship = relationshipById(drag.routeId);
+    if (!relationship) return;
+
+    const delta = (drag.routeAxis === 'y' ? dy : dx) / state.view.zoom;
+    relationship.routeOffset = drag.origin.offset + delta;
+    render();
+    return;
+  }
+
+  if (drag.mode === 'draw-arrow') {
+    const world = toWorld(event.clientX, event.clientY);
+    const vector = constrainVector(
+      world.x - drag.startWorld.x, world.y - drag.startWorld.y,
+      event.shiftKey, event.ctrlKey ? 1 : 4);
+
+    state.pendingArrow.dx = vector.dx;
+    state.pendingArrow.dy = vector.dy;
+    render();
+    return;
+  }
+
+  if (drag.mode === 'arrow-end' || drag.mode === 'arrow-start') {
+    const annotation = annotationById(drag.resizeId);
+    if (!annotation) return;
+
+    const snap = event.ctrlKey ? 1 : 4;
+    const worldDx = Math.round((dx / state.view.zoom) / snap) * snap;
+    const worldDy = Math.round((dy / state.view.zoom) / snap) * snap;
+
+    if (drag.mode === 'arrow-end') {
+      const vector = constrainVector(
+        drag.origin.dx + worldDx, drag.origin.dy + worldDy, event.shiftKey, snap);
+      annotation.dx = vector.dx;
+      annotation.dy = vector.dy;
+    } else {
+      // The tail moves and the head stays put, so the vector takes the opposite correction.
+      annotation.x = drag.origin.x + worldDx;
+      annotation.y = drag.origin.y + worldDy;
+      annotation.dx = drag.origin.dx - worldDx;
+      annotation.dy = drag.origin.dy - worldDy;
+    }
+
+    render();
+    return;
+  }
+
+  if (drag.mode === 'rotate') {
+    const annotation = annotationById(drag.resizeId);
+    if (!annotation) return;
+
+    // Whole degrees, 15 degree steps with Shift, and the same Ctrl escape hatch for fine work that
+    // a move and a resize have. Snapping the *angle itself* rather than the change, unlike the
+    // resize: an angle has a meaningful zero, and "straight" is the value people want to land on.
+    const snap = event.ctrlKey ? 0.5 : event.shiftKey ? 15 : 1;
+
+    const turned = angleAt(drag.origin.centre, toWorld(event.clientX, event.clientY));
+    const delta = wrapDegrees(turned - drag.origin.pointer);
+
+    annotation.tilt = wrapDegrees(Math.round((drag.origin.tilt + delta) / snap) * snap);
+
+    render();
+    return;
+  }
+
+  if (drag.mode === 'resize') {
+    const annotation = annotationById(drag.resizeId);
+    if (!annotation) return;
+
+    // Same snap as a move, and the same Ctrl escape hatch for fine adjustment.
+    const snap = event.ctrlKey ? 1 : 8;
+
+    // Both sides move independently. A sticky note was briefly held square in 1.8.0; the free
+    // resize came back in 1.9.0, because a note stretched into a banner is a legitimate
+    // thing to want on a diagram. The square is still what a *new* note is - see NOTE_DEFAULT_SIZE
+    // - it is just no longer enforced.
+    //
+    // The *change* is snapped rather than the finished size. A note's default side is 140, which
+    // is not a multiple of the 8-unit snap, so snapping the total meant merely touching the grip
+    // of a new note jumped it to 144 and no drag could ever put it back.
+    //
+    // The travel is turned into the note's own frame first. Width and height are lengths along the
+    // note's local axes, and since 1.10.0 those axes can point anywhere: a note turned a half turn
+    // has its grip at the top left of the screen, so adding raw screen travel to the width grew it
+    // away from the pointer, and the further round it was turned the less the drag had to do with
+    // what happened. Below five degrees - every angle that existed before the rotation handle -
+    // the two frames are the same to within a snap step, which is why nothing noticed.
+    const local = toLocal(dx / state.view.zoom, dy / state.view.zoom, drag.origin.tilt);
+
+    const stepX = Math.round(local.x / snap) * snap;
+    const stepY = Math.round(local.y / snap) * snap;
+
+    // A text box has no border and no fill, so it can honestly be one line tall. A sticky note
+    // cannot: below about 56 units it is a coloured square with nothing legible on it.
+    const minHeight = annotationKind(annotation) === 'text' ? 24 : MIN_NOTE_HEIGHT;
+
+    const width = Math.max(MIN_NOTE_WIDTH, drag.origin.width + stepX);
+    const height = Math.max(minHeight, drag.origin.height + stepY);
+
+    annotation.width = width;
+    annotation.height = height;
+
+    // Then put the note back where it has to be for the far corner to have stayed still. The
+    // placed rectangle is axis-aligned and the drawn one is not, so this is the only step that
+    // knows about the tilt at all - everything downstream still reads x, y, width and height.
+    const centre = translate(drag.origin.anchor, { x: width / 2, y: height / 2 }, drag.origin.tilt);
+
+    annotation.x = centre.x - width / 2;
+    annotation.y = centre.y - height / 2;
+
+    render();
+    return;
+  }
+
+  if (drag.mode === 'move') {
+    const worldDx = dx / state.view.zoom;
+    const worldDy = dy / state.view.zoom;
+    const snap = event.ctrlKey ? 1 : 8;
+
+    for (const entry of drag.origin) {
+      const target = entry.kind === 'table' ? tableById(entry.id) : annotationById(entry.id);
+      if (!target) continue;
+      target.x = Math.round((entry.x + worldDx) / snap) * snap;
+      target.y = Math.round((entry.y + worldDy) / snap) * snap;
+    }
+
+    render();
+  }
+}
+
+function onPointerUp(event) {
+  if (!drag.mode) return;
+
+  const mode = drag.mode;
+  drag.mode = null;
+  canvas.classList.remove('is-panning');
+
+  if (drag.button === 2) {
+    suppressContextMenu = drag.moved;
+
+    const held = pendingMenu;
+    pendingMenu = null;
+    if (held && !drag.moved) showMenuFor(held);
+  }
+
+  try { canvas.releasePointerCapture(event.pointerId); } catch (error) { /* pointer already gone */ }
+
+  if (mode === 'route') {
+    const relationship = relationshipById(drag.routeId);
+    drag.routeId = null;
+
+    if (relationship && drag.moved) {
+      const after = relationship.routeOffset;
+      relationship.routeOffset = drag.origin.offset;
+      mutate('move connector', () => { relationship.routeOffset = after; });
+      render();
+    }
+
+    return;
+  }
+
+  if (mode === 'draw-arrow') {
+    const pending = state.pendingArrow;
+    state.pendingArrow = null;
+
+    // A click without a drag is not an arrow. Committing one would leave a zero-length mark on the
+    // canvas that draws nothing and can only be found by marquee.
+    //
+    // The tool stays armed rather than disarming: the other two draw tools are click-to-place, so
+    // a click is the obvious thing to try first, and taking the mode away in silence made the
+    // button look broken. Armed, the banner is still up saying to drag, and Escape still cancels.
+    if (!pending || Math.hypot(pending.dx, pending.dy) < 10) {
+      render();
+      return;
+    }
+
+    endDrawMode();
+
+    const arrow = newAnnotation('arrow', { x: pending.x, y: pending.y },
+      { dx: pending.dx, dy: pending.dy, ink: pending.ink });
+
+    mutate('draw arrow', () => { state.doc.annotations.push(arrow); });
+    selectOnly('annotations', arrow.id);
+    render();
+    onSelectionChange();
+    onAnnotationPlaced(arrow);
+    return;
+  }
+
+  if (mode === 'arrow-end' || mode === 'arrow-start') {
+    const annotation = annotationById(drag.resizeId);
+    drag.resizeId = null;
+
+    // Same shape as every other live drag: the new geometry is already applied, so the undo
+    // snapshot has to be taken from where the arrow started.
+    if (annotation && drag.moved) {
+      const after = {
+        x: annotation.x, y: annotation.y, dx: annotation.dx, dy: annotation.dy
+      };
+
+      Object.assign(annotation, {
+        x: drag.origin.x, y: drag.origin.y, dx: drag.origin.dx, dy: drag.origin.dy
+      });
+
+      mutate('reshape arrow', () => { Object.assign(annotation, after); });
+      render();
+
+      // The arrow panel prints the length, and this drag is what changes it.
+      refreshInspectorSoon();
+    }
+
+    return;
+  }
+
+  if (mode === 'rotate') {
+    const annotation = annotationById(drag.resizeId);
+    drag.resizeId = null;
+
+    // Committed like every other live drag: the new angle is already applied, so the undo snapshot
+    // has to be taken from where the note started. A note that had no angle of its own goes back
+    // to having none rather than to the derived one written out as a number - undoing a rotation
+    // should leave the file exactly as it was, and an explicit tilt is carried into the draw.io
+    // export where a derived slant deliberately is not.
+    if (annotation && drag.moved) {
+      const after = annotation.tilt;
+
+      if (drag.origin.hadTilt) annotation.tilt = drag.origin.tilt;
+      else delete annotation.tilt;
+
+      mutate('rotate note', () => { annotation.tilt = after; });
+      render();
+      refreshInspectorSoon();
+    }
+
+    return;
+  }
+
+  if (mode === 'resize') {
+    const annotation = annotationById(drag.resizeId);
+    drag.resizeId = null;
+
+    // Committed the same way as a move: the live drag already applied the new size, so the
+    // undo snapshot has to be taken from the size the note started at. Position as well as size,
+    // because holding the far corner still moves a turned note as it grows.
+    if (annotation && drag.moved) {
+      const after = {
+        width: annotation.width, height: annotation.height,
+        x: annotation.x, y: annotation.y
+      };
+
+      Object.assign(annotation, {
+        width: drag.origin.width, height: drag.origin.height,
+        x: drag.origin.x, y: drag.origin.y
+      });
+
+      mutate('resize note', () => { Object.assign(annotation, after); });
+
+      render();
+      refreshInspectorSoon();
+    }
+
+    return;
+  }
+
+  if (mode === 'marquee') {
+    finishMarquee(drag.startScreen, { x: event.clientX, y: event.clientY }, event.shiftKey || event.ctrlKey);
+    hideMarquee();
+    return;
+  }
+
+  if (mode === 'move' && drag.moved) {
+    // Commit the drag as one undoable step. The positions were already applied live, so the
+    // snapshot has to be taken from where things were before the drag started.
+    const after = captureMovablePositions();
+    const before = drag.origin;
+
+    for (const entry of before) {
+      const target = entry.kind === 'table' ? tableById(entry.id) : annotationById(entry.id);
+      if (target) { target.x = entry.x; target.y = entry.y; }
+    }
+
+    mutate('move', () => {
+      for (const entry of after) {
+        const target = entry.kind === 'table' ? tableById(entry.id) : annotationById(entry.id);
+        if (target) { target.x = entry.x; target.y = entry.y; }
+      }
+    });
+  }
+
+  if (mode === 'pan') {
+    state.doc.view = { zoom: state.view.zoom, panX: state.view.panX, panY: state.view.panY };
+  }
+}
+
+// -------------------------------------------------------------- marquee ---
+
+function drawMarquee(from, to) {
+  const box = canvas.getBoundingClientRect();
+  const rect = $('#marquee');
+
+  rect.setAttribute('x', Math.min(from.x, to.x) - box.left);
+  rect.setAttribute('y', Math.min(from.y, to.y) - box.top);
+  rect.setAttribute('width', Math.abs(to.x - from.x));
+  rect.setAttribute('height', Math.abs(to.y - from.y));
+  rect.style.display = '';
+}
+
+function hideMarquee() {
+  $('#marquee').style.display = 'none';
+}
+
+function finishMarquee(fromScreen, toScreen, additive) {
+  if (!drag.moved) return;
+
+  const a = toWorld(fromScreen.x, fromScreen.y);
+  const b = toWorld(toScreen.x, toScreen.y);
+
+  const box = {
+    x: Math.min(a.x, b.x),
+    y: Math.min(a.y, b.y),
+    width: Math.abs(b.x - a.x),
+    height: Math.abs(b.y - a.y)
+  };
+
+  if (!additive) clearSelection();
+
+  for (const table of state.doc.tables) {
+    if (rectsIntersect(box, tableRect(table))) state.selection.tables.add(table.id);
+  }
+
+  for (const annotation of state.doc.annotations) {
+    if (rectsIntersect(box, annotationBounds(annotation))) state.selection.annotations.add(annotation.id);
+  }
+
+  render();
+  onSelectionChange();
+}
+
+// ----------------------------------------------------------------- zoom ---
+
+function onWheel(event) {
+  event.preventDefault();
+
+  if (event.shiftKey) {
+    state.view.panX -= event.deltaY;
+    render();
+    return;
+  }
+
+  const factor = Math.exp(-event.deltaY * 0.0016);
+  zoomAt(event.clientX, event.clientY, state.view.zoom * factor);
+}
+
+export function zoomAt(clientX, clientY, targetZoom) {
+  const box = canvas.getBoundingClientRect();
+  const zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, targetZoom));
+
+  const worldX = (clientX - box.left - state.view.panX) / state.view.zoom;
+  const worldY = (clientY - box.top - state.view.panY) / state.view.zoom;
+
+  state.view.zoom = zoom;
+  state.view.panX = clientX - box.left - worldX * zoom;
+  state.view.panY = clientY - box.top - worldY * zoom;
+  state.doc.view = { zoom: state.view.zoom, panX: state.view.panX, panY: state.view.panY };
+
+  render();
+  notify('zoom');
+}
+
+export function zoomBy(factor) {
+  const box = canvas.getBoundingClientRect();
+  zoomAt(box.left + box.width / 2, box.top + box.height / 2, state.view.zoom * factor);
+}
+
+/**
+ * Steps the zoom by whole 5% increments of natural size, snapping to the grid of 5s first so a
+ * wheel zoom followed by a button press still lands on a round number.
+ */
+export function zoomStep(steps) {
+  const current = Math.round(state.view.zoom / ZOOM_STEP) * ZOOM_STEP;
+  const target = Math.round((current + steps * ZOOM_STEP) / ZOOM_STEP) * ZOOM_STEP;
+
+  const box = canvas.getBoundingClientRect();
+  zoomAt(box.left + box.width / 2, box.top + box.height / 2, target);
+}
+
+export function resetZoom() {
+  zoomTo(1);
+}
+
+/** Jumps straight to a zoom level, keeping the centre of the viewport where it is. */
+export function zoomTo(zoom) {
+  const box = canvas.getBoundingClientRect();
+  zoomAt(box.left + box.width / 2, box.top + box.height / 2, zoom);
+}
+
+/**
+ * Opens the canvas at natural size.
+ *
+ * A freshly built diagram used to be fitted to the window, which meant a model of any size opened
+ * at whatever percentage happened to make it fit - 45%, 65% - and the first thing anyone did was
+ * zoom back in to read a card. 100% is the size the whole drawing is designed at, so that is where
+ * it starts; the pan puts the top-left of the content just inside the visible area, clear of the
+ * command bar and the left panel, and Fit is one click away for the rare case it is wanted.
+ */
+export function resetView() {
+  const rects = state.doc.tables.map(tableRect);
+  for (const annotation of state.doc.annotations) rects.push(annotationBounds(annotation));
+
+  state.view.zoom = 1;
+
+  if (!rects.length) {
+    state.view.panX = 60;
+    state.view.panY = 90;
+  } else {
+    const leftPanel = document.getElementById('left-panel');
+    const leftInset = leftPanel && !leftPanel.classList.contains('is-collapsed')
+      ? leftPanel.offsetWidth + 28 : 50;
+
+    state.view.panX = leftInset + 40 - Math.min(...rects.map(r => r.x));
+    state.view.panY = 110 - Math.min(...rects.map(r => r.y));
+  }
+
+  state.doc.view = { zoom: state.view.zoom, panX: state.view.panX, panY: state.view.panY };
+
+  render();
+  notify('zoom');
+}
+
+/** Fits everything on the canvas, allowing for the floating panels covering the edges. */
+export function fitToView(padding) {
+  // Keyed on both, not on tables alone: a diagram of sticky notes and arrows with no cards in it
+  // is a perfectly ordinary thing to draw, and it used to be the one diagram that could not be
+  // fitted - the early return sent it back to 100% at the default pan every time.
+  const tables = state.doc.tables;
+  const annotations = state.doc.annotations || [];
+
+  if (!tables.length && !annotations.length) {
+    state.view.zoom = 1;
+    state.view.panX = 60;
+    state.view.panY = 90;
+    render();
+    notify('zoom');
+    return;
+  }
+
+  // documentBounds rather than a local pass over the card and note rectangles: it measures the
+  // connector routes too, so a connector that has been dragged clear of the cards it joins can be
+  // brought back into view. Asked for with no padding of its own - the inset below is this
+  // function's margin, and adding both would fit the diagram smaller than it needs to be.
+  const bounds = documentBounds(0);
+  const minX = bounds.x;
+  const minY = bounds.y;
+  const maxX = bounds.x + bounds.width;
+  const maxY = bounds.y + bounds.height;
+
+  const box = canvas.getBoundingClientRect();
+  const inset = padding === undefined ? 40 : padding;
+
+  const leftPanel = document.getElementById('left-panel');
+  const leftInset = leftPanel && !leftPanel.classList.contains('is-collapsed') ? leftPanel.offsetWidth + 28 : 50;
+  const inspector = document.getElementById('inspector');
+  const rightInset = inspector && !inspector.hidden ? inspector.offsetWidth + 28 : 50;
+  const topInset = 90;
+  const bottomInset = 70;
+
+  const available = {
+    width: Math.max(120, box.width - leftInset - rightInset - inset * 2),
+    height: Math.max(120, box.height - topInset - bottomInset - inset * 2)
+  };
+
+  const contentWidth = Math.max(1, maxX - minX);
+  const contentHeight = Math.max(1, maxY - minY);
+
+  // Never magnify past natural size: 100% is the reference the zoom readout is built around, and
+  // a small diagram blown up to 140% just looks wrong. Rounded down to a whole 5% step so the
+  // readout after a fit matches the steps the buttons move in.
+  const raw = Math.min(available.width / contentWidth, available.height / contentHeight, 1);
+  const zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.floor(raw / ZOOM_STEP) * ZOOM_STEP));
+
+  state.view.zoom = zoom;
+  state.view.panX = leftInset + inset + (available.width - contentWidth * zoom) / 2 - minX * zoom;
+  state.view.panY = topInset + inset + (available.height - contentHeight * zoom) / 2 - minY * zoom;
+  state.doc.view = { zoom: state.view.zoom, panX: state.view.panX, panY: state.view.panY };
+
+  render();
+  notify('zoom');
+}
+
+/** Centres the viewport on a table without changing zoom. */
+export function focusTable(tableId) {
+  const table = tableById(tableId);
+  if (!table) return;
+
+  const size = measureTable(table);
+  const box = canvas.getBoundingClientRect();
+
+  state.view.panX = box.width / 2 - (table.x + size.width / 2) * state.view.zoom;
+  state.view.panY = box.height / 2 - (table.y + size.height / 2) * state.view.zoom;
+
+  render();
+  notify('focus');
+}
+
+// ------------------------------------------------------------- keyboard ---
+
+function onKeyDown(event) {
+  if (isTypingTarget(event.target)) return;
+
+  // A dialog is covering the canvas, and every shortcut below acts on that canvas. Opening a
+  // dialog focuses nothing, so activeElement stays on the body or on the command-bar button that
+  // was clicked - neither is a typing target - and Delete then destroyed the selection behind the
+  // backdrop with no confirmation at all. Escape is not an exception worth carving out: ui.js
+  // listens for it on the document, which is ahead of this window listener and stops the event
+  // there, so the dialog still closes exactly as before.
+  if (isModalCovering()) return;
+
+  if (event.code === 'Space' && !drag.spaceHeld) {
+    drag.spaceHeld = true;
+    canvas.classList.add('is-pan-ready');
+    event.preventDefault();
+    return;
+  }
+
+  const ctrl = event.ctrlKey || event.metaKey;
+
+  if (ctrl && event.key.toLowerCase() === 'a') {
+    event.preventDefault();
+    clearSelection();
+    for (const table of state.doc.tables) state.selection.tables.add(table.id);
+    render();
+    onSelectionChange();
+    return;
+  }
+
+  if (event.key === 'Delete' || event.key === 'Backspace') {
+    event.preventDefault();
+    deleteSelection();
+    return;
+  }
+
+  if (event.key === 'Escape') {
+    // Escape backs out of the most recent thing first: connect mode, then an open note, then a
+    // path highlight, then the selection. Clearing them all at once would take away context the
+    // user was still using.
+    if (state.connect && state.connect.fromTableId) { endConnectMode(); return; }
+
+    if (isDrawing() || state.pendingArrow) {
+      drag.mode = null;
+      endDrawMode();
+      render();
+      return;
+    }
+
+    if (state.openNote) {
+      state.openNote = null;
+      render();
+      return;
+    }
+
+    if (state.highlightPath) {
+      state.highlightPath = null;
+      render();
+      return;
+    }
+
+    clearSelection();
+    render();
+    onSelectionChange();
+    return;
+  }
+
+  if (!ctrl && (event.key === '+' || event.key === '=')) { zoomStep(1); return; }
+  if (!ctrl && (event.key === '-' || event.key === '_')) { zoomStep(-1); return; }
+  if (!ctrl && event.key === '0') { resetZoom(); return; }
+  if (!ctrl && event.key.toLowerCase() === 'f') { fitToView(); return; }
+}
+
+function onKeyUp(event) {
+  if (event.code === 'Space') {
+    drag.spaceHeld = false;
+    canvas.classList.remove('is-pan-ready');
+  }
+}
+
+/** The keyup for a held Space never arrives if the window lost focus first. See initInteractions. */
+function onWindowBlur() {
+  if (!drag.spaceHeld) return;
+  drag.spaceHeld = false;
+  canvas.classList.remove('is-pan-ready');
+}
+
+/**
+ * Whether focus is somewhere a keystroke means text rather than a command.
+ *
+ * Exported because app.js's Ctrl-shortcuts need the same test - duplicated there, the two would
+ * drift, and the version that forgot contenteditable is the one that reverts a canvas edit when
+ * the user presses Ctrl+Z inside a note.
+ */
+export function isTypingTarget(node) {
+  if (!node) return false;
+  const tag = node.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || node.isContentEditable;
+}
+
+/**
+ * Whether a dialog is on screen.
+ *
+ * Read off the DOM rather than by importing ui.js's isModalOpen: ui.js is the layer underneath
+ * this one and deliberately knows nothing about the canvas - see the dmd:modal-opened listener in
+ * initInteractions - so the dependency runs one way only. #modal-root is emptied and hidden when
+ * the last dialog closes, so its first child answers the same question.
+ */
+function isModalCovering() {
+  const root = document.getElementById('modal-root');
+  return !!(root && !root.hidden && root.firstChild);
+}
+
+/**
+ * Removes the selected objects from the diagram. This is a diagram-level delete: nothing is
+ * removed from Dataverse, which the confirmation wording makes explicit.
+ */
+export function deleteSelection() {
+  const tableCount = state.selection.tables.size;
+  const linkCount = state.selection.relationships.size;
+  const noteCount = state.selection.annotations.size;
+
+  if (!tableCount && !linkCount && !noteCount) return;
+
+  mutate('delete', () => {
+    for (const id of Array.from(state.selection.tables)) removeTable(id);
+    for (const id of Array.from(state.selection.relationships)) removeRelationship(id);
+    for (const id of Array.from(state.selection.annotations)) removeAnnotation(id);
+  });
+
+  clearSelection();
+  render();
+  onSelectionChange();
+}
+
+// -------------------------------------------------------------- context ---
+
+function onCanvasContextMenu(event) {
+  event.preventDefault();
+
+  if (suppressContextMenu) {
+    suppressContextMenu = false;
+    return;
+  }
+
+  if (drag.mode === 'pan' && drag.button === 2) {
+    pendingMenu = { target: event.target, clientX: event.clientX, clientY: event.clientY };
+    return;
+  }
+
+  showMenuFor(event);
+}
+
+function showMenuFor(source) {
+  const hit = hitTest(source);
+  if (hit) {
+    const kind = hit.kind === 'table' ? 'tables'
+      : hit.kind === 'relationship' ? 'relationships' : 'annotations';
+
+    if (!state.selection[kind].has(hit.id)) {
+      selectOnly(kind, hit.id);
+      render();
+      onSelectionChange();
+    }
+  }
+
+  onContextMenu(source, hit, toWorld(source.clientX, source.clientY));
+}
+
+function onDoubleClick(event) {
+  const hit = hitTest(event);
+  if (!hit) return;
+  event.preventDefault();
+  onOpenEditor(hit, toWorld(event.clientX, event.clientY));
+}
+
+export function isPanning() { return drag.mode === 'pan'; }
+
+// ------------------------------------------------------- connect mode ----
+
+/**
+ * Arms "click the other end". The banner is the whole point: a mode with no visible sign it is on
+ * is a trap, and Escape or a click on empty canvas always gets out of it.
+ */
+export function startConnectMode(fromTableId) {
+  endDrawMode();
+
+  state.connect = { fromTableId };
+  canvas.classList.add('is-connecting');
+
+  const table = tableById(fromTableId);
+  const name = table ? (table.displayName || table.logicalName) : 'this table';
+
+  showBanner('Click the other table to draw a proposed relationship from ' + name +
+             '.  Escape to cancel.');
+}
+
+export function endConnectMode() {
+  state.connect = null;
+  if (canvas) canvas.classList.remove('is-connecting');
+  hideBanner();
+}
+
+export function isConnecting() { return !!(state.connect && state.connect.fromTableId); }
+
+// ---------------------------------------------------------- draw tools ----
+
+/**
+ * Arms one of the draw tools.
+ *
+ * The same shape as connect mode, and for the same reason: the next click on the canvas is about to
+ * mean something other than "select this", and a mode with nothing on screen saying it is on is a
+ * trap. Escape and a right-click always get out of it, opening any dialog cancels it, and for the
+ * note and text tools a left click is what places the thing rather than a way out.
+ */
+export function startDrawMode(tool, options) {
+  endConnectMode();
+
+  state.draw = Object.assign({ tool }, options || {});
+  if (canvas) canvas.classList.add('is-drawing');
+
+  showBanner(
+    tool === 'arrow'
+      ? 'Drag on the canvas to draw an arrow.  Hold Shift to keep it straight, Escape to cancel.'
+      : tool === 'text'
+        ? 'Click on the canvas to place a text box, then type into the Text box on the right.  Escape to cancel.'
+        : 'Click on the canvas to place a sticky note, then type into the Text box on the right.  Escape to cancel.');
+}
+
+export function endDrawMode() {
+  const wasOn = !!state.draw || !!state.pendingArrow;
+
+  state.draw = null;
+  state.pendingArrow = null;
+  if (canvas) canvas.classList.remove('is-drawing');
+
+  if (wasOn) hideBanner();
+}
+
+export function isDrawing() { return !!(state.draw && state.draw.tool); }
+
+/** Drops a sticky note or a text box at a point on the canvas and hands it to the inspector. */
+function placeAnnotation(kind, worldPoint) {
+  const seed = newAnnotation(kind, { x: 0, y: 0 });
+
+  // Centred horizontally on the click and hung just below it, so the thing appears where the
+  // user pointed rather than with its top-left corner there.
+  const annotation = newAnnotation(kind, {
+    x: Math.round((worldPoint.x - seed.width / 2) / 8) * 8,
+    y: Math.round((worldPoint.y - 12) / 8) * 8
+  });
+
+  mutate(kind === 'text' ? 'add text box' : 'add sticky note', () => {
+    state.doc.annotations.push(annotation);
+  });
+
+  selectOnly('annotations', annotation.id);
+  render();
+  onSelectionChange();
+  onAnnotationPlaced(annotation);
+}
+
+/**
+ * A drag vector, snapped to the grid and optionally to the nearest 45 degrees.
+ *
+ * Shift-constraint is what makes a horizontal arrow horizontal. Without it, an arrow drawn beside
+ * a row of cards is a degree or two off and reads as a mistake rather than as a pointer.
+ */
+function constrainVector(dx, dy, constrain, snap) {
+  let x = dx;
+  let y = dy;
+
+  if (constrain) {
+    const length = Math.hypot(x, y);
+    const step = Math.PI / 4;
+    const angle = Math.round(Math.atan2(y, x) / step) * step;
+
+    x = Math.cos(angle) * length;
+    y = Math.sin(angle) * length;
+  }
+
+  const grid = snap || 1;
+  return { dx: Math.round(x / grid) * grid, dy: Math.round(y / grid) * grid };
+}
+
+// ------------------------------------------------------------- banner ----
+
+/** The one banner both connect mode and the draw tools use. They are mutually exclusive. */
+function showBanner(text) {
+  let banner = document.getElementById('connect-banner');
+
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'connect-banner';
+    banner.className = 'connect-banner';
+    document.body.appendChild(banner);
+  }
+
+  banner.textContent = text;
+  banner.hidden = false;
+}
+
+function hideBanner() {
+  const banner = document.getElementById('connect-banner');
+  if (banner) banner.hidden = true;
+}
