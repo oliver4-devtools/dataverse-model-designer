@@ -12,7 +12,7 @@ Dataverse metadata -> explore -> select -> understand -> design -> annotate -> s
 a diagram, marking something deprecated, or designing a proposed table are all diagram-level
 actions held in the diagram file. Nothing is created, changed or deleted in Dataverse.
 
-![Version](https://img.shields.io/badge/version-1.10.0-blue)
+![Version](https://img.shields.io/badge/version-1.11.3-blue)
 ![Licence](https://img.shields.io/badge/licence-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-XrmToolBox%20%7C%20Windows-lightgrey)
 
@@ -20,9 +20,10 @@ actions held in the diagram file. Nothing is created, changed or deleted in Data
 
 ## Screenshots
 
-![The canvas](docs/screenshot-canvas.png)
-![Relationship inspector](docs/screenshot-inspector.png)
-![Proposed tables](docs/screenshot-proposed-tables.png)
+<!-- TODO: add screenshots before publishing -->
+<!-- ![The canvas](docs/screenshot-canvas.png) -->
+<!-- ![Relationship inspector](docs/screenshot-inspector.png) -->
+<!-- ![Documentation export](docs/screenshot-export.png) -->
 
 ---
 
@@ -34,7 +35,7 @@ actions held in the diagram file. Nothing is created, changed or deleted in Data
 | **Exploring** | Start from one table and walk outwards to a chosen depth, grouped by hop. Filters for relationship direction, N:N, Microsoft-supplied tables, activity tables, intersect tables and platform plumbing. Results are reviewed before anything is added. |
 | **Relationships** | Discovers 1:N, N:1 and N:N between the tables on the canvas, including between tables you are adding and tables already there. Multiple relationships between the same pair stay individually selectable and are fanned out visually. |
 | **Detail levels** | Tables only, relationship columns, or all columns, with per-table overrides and independent toggles for display names, schema names, types, key markers, cardinality and cascade. |
-| **Canvas** | Pan, zoom in 5% steps or to a preset, drag, marquee select, snap, undo and redo, five automatic layouts, draggable connectors with line jumps, and twelve emphasis colours that can each be given a name that appears in the legend and in exports. The legend is draggable and its position is saved with the diagram. |
+| **Canvas** | Pan, zoom in 5% steps or to a preset, drag, marquee select, snap, undo and redo, five automatic layouts, draggable connectors with line jumps whose corners can each be dragged by hand, and bends removed, and twelve emphasis colours that can each be given a name that appears in the legend and in exports. The legend is draggable and its position is saved with the diagram. |
 | **Annotation** | Sticky notes (resizable, rotatable, optionally attached to a table or a connector with a leader line), text boxes and arrows. Each can be drawn in front of the model or behind it, and all of them reach the picture exports. |
 | **Inspection** | Relationship inspector showing schema name, cardinality, participating tables, primary key, lookup column, custom or system, polymorphic targets and the full assign / delete / merge / reparent / share / unshare cascade configuration. Table inspector shows how records are owned. |
 | **Design** | Propose a new table, a column on an existing table, a relationship between any two tables, or an external system. Proposed, external and deprecated objects are distinguished by border pattern, badge and colour together. A proposed one-to-many writes the lookup column it implies onto the table at the many end and draws the connector to that row. |
@@ -236,3 +237,25 @@ WebView2 and Newtonsoft.Json. The canvas checks run the web modules under a mini
 finish by loading the document the C# checks serialised, which proves both runtimes agree on the
 wire format. Neither is a substitute for building and running against the real packages.
 
+---
+
+## Contributing and feedback
+
+Bug reports and suggestions are welcome through
+[GitHub Issues](https://github.com/oliver4-devtools/dataverse-model-designer/issues). Please include the tool version, the
+XrmToolBox version, and what you were doing at the time.
+
+There is no formal support arrangement for this tool. If you would rather not raise an issue, you
+can send suggestions to info@oliver4-devtools.com.
+
+Pull requests are welcome. Please run both verification suites before opening one.
+
+---
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
+
+Microsoft, Dataverse, Dynamics 365, Visio and Power Platform are trademarks of Microsoft
+Corporation. This tool is not affiliated with or endorsed by Microsoft. XrmToolBox is an
+independent open-source project and this tool is not affiliated with or endorsed by it.
