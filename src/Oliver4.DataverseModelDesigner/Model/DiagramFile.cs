@@ -429,6 +429,7 @@ namespace Oliver4.DataverseModelDesigner.Model
             {
                 if (table.Columns == null) table.Columns = new List<DiagramColumn>();
                 if (table.AlternateKeys == null) table.AlternateKeys = new List<AlternateKeyInfo>();
+                if (table.ColumnOrder == null) table.ColumnOrder = new List<string>();
                 if (string.IsNullOrEmpty(table.Id)) table.Id = Guid.NewGuid().ToString("N");
                 foreach (var column in table.Columns)
                 {
@@ -442,6 +443,29 @@ namespace Oliver4.DataverseModelDesigner.Model
                 if (relationship.Waypoints == null) relationship.Waypoints = new List<PointD>();
                 if (relationship.LookupTargets == null) relationship.LookupTargets = new List<string>();
                 if (string.IsNullOrEmpty(relationship.Id)) relationship.Id = Guid.NewGuid().ToString("N");
+
+                // The same guard the legend position gets, and for the same reason. Neither offset
+                // can be made infinite or NaN by a drag, and both reach the canvas straight from
+                // the file: an infinite one is carried into the route's points, out of there into
+                // documentBounds, and from there into Fit and every picture export as a drawing
+                // with no finite extent.
+                if (double.IsNaN(relationship.RouteOffset) || double.IsInfinity(relationship.RouteOffset))
+                    relationship.RouteOffset = 0;
+
+                if (double.IsNaN(relationship.RouteOffsetCross) || double.IsInfinity(relationship.RouteOffsetCross))
+                    relationship.RouteOffsetCross = 0;
+
+                // The corners the user moved by hand, cleaned by exactly the same rule and for
+                // exactly the same reason: a corner is a point on the drawn route, so one that is
+                // null or not a pair of finite numbers reaches documentBounds, Fit and every
+                // picture export the same way an infinite offset does. A file listing "waypoints"
+                // as something other than a list of points deserialises as an empty one, which is
+                // the same thing as an automatic route.
+                relationship.Waypoints = relationship.Waypoints
+                    .Where(point => point != null
+                        && !double.IsNaN(point.X) && !double.IsInfinity(point.X)
+                        && !double.IsNaN(point.Y) && !double.IsInfinity(point.Y))
+                    .ToList();
 
                 // Exclude was removed in 1.7.0 because it duplicated Hide: both kept the
                 // relationship in the file, off the canvas and out of every export, and the two

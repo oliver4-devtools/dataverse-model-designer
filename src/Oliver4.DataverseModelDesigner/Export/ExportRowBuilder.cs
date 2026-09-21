@@ -100,7 +100,7 @@ namespace Oliver4.DataverseModelDesigner.Export
             if (table.Collapsed) mode = FieldDetailMode.TablesOnly;
             if (mode == FieldDetailMode.TablesOnly) return new List<DiagramColumn>();
 
-            return OrderColumns(SelectColumns(document, table, mode), document.Settings.FieldOrder);
+            return OrderColumns(SelectColumns(document, table, mode), document.Settings.FieldOrder, table);
         }
 
         /// <summary>
@@ -112,8 +112,19 @@ namespace Oliver4.DataverseModelDesigner.Export
         /// therefore listed a table's rows in a different order from the picture beside it, and
         /// choosing "Display name" under Column order changed the canvas and no document at all.
         /// </summary>
-        private static List<DiagramColumn> OrderColumns(List<DiagramColumn> columns, string order)
+        private static List<DiagramColumn> OrderColumns(List<DiagramColumn> columns, string order, DiagramTable table)
         {
+            // A card whose rows the user has dragged into an order is in that order, and neither
+            // the sort nor the key float gets to move them back. The mirror of the manual branch in
+            // `orderColumns` in Web/js/geometry.js: change one, change the other.
+            var manual = ManualOrder(table);
+            if (manual != null)
+            {
+                return columns
+                    .OrderBy(c => ManualRank(manual, c))
+                    .ToList();
+            }
+
             var ranked = columns;
 
             if (string.Equals(order, "displayName", StringComparison.OrdinalIgnoreCase))
@@ -144,6 +155,57 @@ namespace Oliver4.DataverseModelDesigner.Export
         /// </summary>
         private static readonly StringComparer ColumnNameComparer =
             StringComparer.Create(CultureInfo.GetCultureInfo("en-GB"), true);
+
+        /// <summary>
+        /// The card's manual field order as name to position, or null when it has none. Mirrors
+        /// `manualColumnOrder` in Web/js/geometry.js, duplicate names and blanks included.
+        /// </summary>
+        private static Dictionary<string, int> ManualOrder(DiagramTable table)
+        {
+            var order = table == null ? null : table.ColumnOrder;
+            if (order == null || order.Count == 0) return null;
+
+            var positions = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+            for (var i = 0; i < order.Count; i++)
+            {
+                var key = order[i];
+                if (string.IsNullOrEmpty(key) || positions.ContainsKey(key)) continue;
+                positions[key] = i;
+            }
+
+            return positions.Count == 0 ? null : positions;
+        }
+
+        /// <summary>
+        /// Where one column sits in a manual order. A column the order has never heard of - added
+        /// by a refresh, or renamed since - sorts after everything it has, in the order it would
+        /// have had on its own. OrderBy is stable, so equal ranks keep their metadata order, which
+        /// is what the JavaScript's own sort relies on too.
+        /// </summary>
+        private static int ManualRank(Dictionary<string, int> manual, DiagramColumn column)
+        {
+            int at;
+            return manual.TryGetValue(ColumnOrderKey(column), out at) ? at : manual.Count + Rank(column);
+        }
+
+        /// <summary>
+        /// The key a column is written into a card's manual order under. The mirror of
+        /// `columnOrderKey` in Web/js/geometry.js, fallbacks and all.
+        ///
+        /// Written with IsNullOrEmpty rather than ??, because the JavaScript's `||` falls through
+        /// on an empty string and ?? only falls through on null - so a column with an empty logical
+        /// name and a schema name was ordered by the canvas and left unordered by every export.
+        /// The id is the last resort: every column has to have a key, or the order cannot describe
+        /// it and it is sorted after every column that the order does name.
+        /// </summary>
+        private static string ColumnOrderKey(DiagramColumn column)
+        {
+            if (column == null) return string.Empty;
+            if (!string.IsNullOrEmpty(column.LogicalName)) return column.LogicalName;
+            if (!string.IsNullOrEmpty(column.SchemaName)) return column.SchemaName;
+            return column.Id ?? string.Empty;
+        }
 
         private static int Rank(DiagramColumn column)
         {

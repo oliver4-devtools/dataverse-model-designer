@@ -67,7 +67,7 @@ export function visibleColumns(table) {
   if (mode === 'TablesOnly') return [];
 
   const columns = table.columns || [];
-  if (mode === 'AllFields') return orderColumns(columns.filter(c => c.selected !== false), doc.settings.fieldOrder);
+  if (mode === 'AllFields') return orderColumns(columns.filter(c => c.selected !== false), doc.settings.fieldOrder, table);
 
   const wanted = new Set();
   if (table.primaryIdAttribute) wanted.add(table.primaryIdAttribute.toLowerCase());
@@ -99,10 +99,62 @@ export function visibleColumns(table) {
     if (fallback) selected = [fallback];
   }
 
-  return orderColumns(selected, doc.settings.fieldOrder);
+  return orderColumns(selected, doc.settings.fieldOrder, table);
 }
 
-function orderColumns(columns, order) {
+/**
+ * The key a card's manual field order is written against.
+ *
+ * The logical name rather than the column id, because a column can be replaced by an object with a
+ * new id and the same name - a proposed column settling against the real one on a refresh does
+ * exactly that - and the position the user put it in should survive that. The cost is the other
+ * way round: a column that is *renamed* loses its place and goes back to the bottom of the card.
+ */
+export function columnOrderKey(column) {
+  const entry = column || {};
+
+  // The id is the last resort rather than the first choice, for the reason in the doc comment
+  // above. But every column has to have a key of *some* kind. A proposed column whose display name slugs
+  // to nothing carries neither name, and a column with no key at all is one the order cannot
+  // describe: it was dropped from the order and then sorted after everything the order did name,
+  // so a drag of two entirely unrelated rows shoved it to the bottom of the card.
+  const named = String(entry.logicalName || entry.schemaName || '').toLowerCase();
+  return named || String(entry.id || '').toLowerCase();
+}
+
+/** The card's manual field order as name to position, or null when the user has not set one. */
+export function manualColumnOrder(table) {
+  const order = (table || {}).columnOrder;
+  if (!Array.isArray(order) || !order.length) return null;
+
+  const positions = new Map();
+  order.forEach((name, index) => {
+    const key = String(name || '').toLowerCase();
+    if (key && !positions.has(key)) positions.set(key, index);
+  });
+
+  return positions.size ? positions : null;
+}
+
+function orderColumns(columns, order, table) {
+  // A card the user has dragged rows around on is in the order they left it in, and neither the
+  // sort nor the key float gets to move them back. That is the whole point of dragging one: the
+  // order is being chosen so the connectors leaving the card do not cross, which is a judgement
+  // about this drawing that no rule here can make.
+  //
+  // A column the manual order has never heard of - added by a refresh, or renamed since - sorts
+  // after everything it has, in the order it would have had on its own.
+  const manual = manualColumnOrder(table);
+  if (manual) {
+    const size = manual.size;
+    return columns.slice().sort((a, b) => manualRank(a) - manualRank(b));
+
+    function manualRank(column) {
+      const at = manual.get(columnOrderKey(column));
+      return at === undefined ? size + rank(column) : at;
+    }
+  }
+
   const ranked = columns.slice();
   if (order === 'displayName') {
     ranked.sort((a, b) => String(a.displayName || '').localeCompare(String(b.displayName || ''), 'en-GB'));
@@ -119,6 +171,50 @@ function orderColumns(columns, order) {
     if (column.isLookup) return 2;
     return 3;
   }
+}
+
+/**
+ * Every column on a table, in the order the card would draw them in - the ones it is not currently
+ * showing included.
+ *
+ * For the inspector's column list, which iterates the table's columns in metadata order and so
+ * disagreed with the card as soon as a row had been dragged: the list said one thing, the picture
+ * beside it another, and the tick boxes are the control for what is on that picture.
+ */
+export function orderedColumns(table) {
+  return orderColumns((table || {}).columns || [], state.doc.settings.fieldOrder, table);
+}
+
+/**
+ * The card's manual field order once the drawn rows have been put in a new order.
+ *
+ * Pure: it hands back the array to write to `table.columnOrder` and touches nothing, so the drag
+ * that calls it on every pointer move can put the old one back when it is abandoned.
+ *
+ * Only the drawn rows move, and only among the positions they already occupy. A column the card is
+ * not showing keeps its place in the order exactly, so switching a card to all its columns after
+ * dragging two rows about does not find the hidden ones piled up at one end.
+ */
+export function cardOrderAfterMove(table, movedKeys) {
+  const full = orderColumns(table.columns || [], state.doc.settings.fieldOrder, table)
+    .map(columnOrderKey)
+    .filter(key => key);
+
+  const wanted = (movedKeys || []).filter(key => key);
+  const next = full.slice();
+  const slots = [];
+
+  full.forEach((key, index) => { if (wanted.includes(key)) slots.push(index); });
+
+  let taken = 0;
+  for (const slot of slots) next[slot] = wanted[taken++];
+
+  // A drawn column with no place in the order at all - one whose logical name is empty, or which
+  // arrived after the order was written. It goes on the end rather than being dropped, so the
+  // order always describes every row the user can see.
+  for (const key of wanted.slice(taken)) if (!next.includes(key)) next.push(key);
+
+  return next;
 }
 
 /**
@@ -294,6 +390,7 @@ export function measureTable(table) {
               '~' + (table.schemaName || '') + '|' + (table.primaryIdAttribute || '') +
               '|' + alternateKeyKey(table) +
               '|' + columnNameKey(table) +
+              '|' + (table.columnOrder || []).join(',') +
               '|' + topology;
 
   const cached = sizeCache.get(key);
@@ -610,24 +707,24 @@ function primaryKeyRowY(rect) {
 }
 
 /**
- * Where a horizontal connector meets a card. It points at the column the relationship actually
- * uses when that column is drawn; otherwise it meets the middle of the header rather than its
- * bottom edge, so it reads as "this table" instead of pointing at whichever field happens to be
- * first.
+ * The row on a card that a connector end belongs to, or null when the card is not showing it.
  *
- * The one end of a *proposed* 1:N takes a second try before it settles for the header: the row the
- * card itself calls its primary key. What a lookup holds is the other table's primary key, so that
- * row is the right target whether or not `referencedAttribute` has been filled in - and on a
- * proposal it is derived rather than read from Dataverse, so it can still be empty when the table
- * at the one end has not named its key yet. An existing relationship's referenced attribute comes
- * from the metadata and is already right; if the column it names is not on the card, the card
- * genuinely is not showing it and the header is the honest answer.
+ * The one end of a *proposed* 1:N takes a second try: the row the card itself calls its primary
+ * key. What a lookup holds is the other table's primary key, so that row is the right target
+ * whether or not `referencedAttribute` has been filled in - and on a proposal it is derived rather
+ * than read from Dataverse, so it can still be empty when the table at the one end has not named
+ * its key yet. An existing relationship's referenced attribute comes from the metadata and is
+ * already right; if the column it names is not on the card, the card genuinely is not showing it.
  *
  * Deliberately a fallback rather than an override. A named attribute that *is* drawn still wins,
- * and a primary key the user has unticked in the inspector is not drawn at all, so this never
- * puts back a row somebody has taken off the card - it lands on the header, same as before.
+ * and a primary key the user has unticked in the inspector is not drawn at all, so this never puts
+ * back a row somebody has taken off the card.
+ *
+ * Separate from anchorY because the answer "there is no row to point at" is itself load-bearing:
+ * it is what decides whether a vertical run may leave through the side of the card - see
+ * routeRelationship.
  */
-function anchorY(rect, attributeName, fallBackToPrimaryKey) {
+function rowAnchor(rect, attributeName, fallBackToPrimaryKey) {
   const row = rowCentreY(rect, attributeName);
   if (row !== null) return row;
 
@@ -636,7 +733,18 @@ function anchorY(rect, attributeName, fallBackToPrimaryKey) {
     if (key !== null) return key;
   }
 
-  return rect.y + METRICS.headerHeight / 2;
+  return null;
+}
+
+/**
+ * Where a connector meets the left or right edge of a card. It points at the column the
+ * relationship actually uses when that column is drawn; otherwise it meets the middle of the
+ * header rather than its bottom edge, so it reads as "this table" instead of pointing at whichever
+ * field happens to be first.
+ */
+function anchorY(rect, attributeName, fallBackToPrimaryKey) {
+  const row = rowAnchor(rect, attributeName, fallBackToPrimaryKey);
+  return row === null ? rect.y + METRICS.headerHeight / 2 : row;
 }
 
 function clampBetween(value, a, b) {
@@ -646,14 +754,435 @@ function clampBetween(value, a, b) {
 }
 
 /**
- * Orthogonal route between two table cards. Returns the path points, the two end anchors, the
- * side each anchor sits on so markers can be oriented, and which axis a manual drag moves the
- * middle of the route along.
+ * Drops the points a route does not need: a repeat of the point before it, and a corner that turns
+ * through nothing.
  *
- * End anchors never move with the manual offset: dragging a connector separates it from the ones
- * it overlaps without changing what either end points at.
+ * Both appear once an offset can be dragged to zero along either axis - the shapes below are
+ * written so that a zero offset collapses back to the shape the route had before the drag, rather
+ * than jumping to a different one as the pointer crosses the axis, and collapsing is what leaves
+ * these behind. A zero-length leg would give pathFromPoints a corner with no direction to round
+ * and midpointOf a label position that is not on the drawn line.
+ */
+function tidy(points) {
+  let kept = dedupe(points);
+
+  for (let i = kept.length - 2; i > 0; i--) {
+    const before = kept[i - 1];
+    const here = kept[i];
+    const after = kept[i + 1];
+
+    const inLine = Math.abs(before.x - here.x) < 0.01 && Math.abs(here.x - after.x) < 0.01;
+    const level = Math.abs(before.y - here.y) < 0.01 && Math.abs(here.y - after.y) < 0.01;
+    if (!inLine && !level) continue;
+
+    // Sharing a coordinate is not enough to make a point removable. Three points on one line with
+    // the middle one *outside* the other two is a leg that goes out and comes straight back, and a
+    // route through a hand-placed corner really can be that - the user put a corner somewhere the
+    // two beside it cannot be reached through in one pass. Removed as if it were a straight run,
+    // the drawn line silently stopped passing through a corner the user had placed, leaving its
+    // handle in mid-air off the end of the line and the drag that put it there doing nothing at
+    // all.
+    //
+    // Only a hand-placed corner is spared. An automatic route can produce the same shape when an
+    // offset is dragged past a clamp, and there the excursion is a wrinkle in a shape the user
+    // never asked for point by point: it has always been tidied away and it stays that way.
+    const doublesBack = inLine
+      ? !between(here.y, before.y, after.y)
+      : !between(here.x, before.x, after.x);
+
+    if (doublesBack && Number.isInteger(here.pin)) continue;
+
+    kept.splice(i, 1);
+  }
+
+  // Again, because taking a point out of the middle can leave its two neighbours on top of each
+  // other, and the first pass has already been past them. A leg of no length gives pathFromPoints
+  // a corner with no direction to round.
+  kept = dedupe(kept);
+
+  return kept.length >= 2 ? kept : points.slice();
+}
+
+/** Drops a point that repeats the one before it. */
+function dedupe(points) {
+  const kept = [];
+
+  for (const point of points) {
+    const last = kept[kept.length - 1];
+    if (last && samePoint(last, point)) continue;
+    kept.push(point);
+  }
+
+  return kept;
+}
+
+/** Whether a value lies between two others, either way round, ends included. */
+function between(value, a, b) {
+  return value >= Math.min(a, b) - 0.01 && value <= Math.max(a, b) + 0.01;
+}
+
+/**
+ * How much clear space there has to be between two cards before a connector will turn between
+ * them. Less than this and a route that leaves through the sides has nowhere to put its middle
+ * segment, so it goes round the outside instead.
+ */
+const SIDE_ROUTE_CLEARANCE = 40;
+
+/**
+ * Orthogonal route between two table cards, with whatever corners the user has moved by hand.
+ *
+ * The automatic route below decides everything about the two ends - which sides the connector
+ * leaves through, which row each end points at, which of the three shapes the pair of cards calls
+ * for. Hand-placed corners replace the *middle* of it and nothing else, so dragging a corner can
+ * never take an end off the column it points at, and a connector that is followed round the
+ * outside of two stacked cards is still followed round the outside once one of its corners has
+ * been moved.
  */
 export function routeRelationship(relationship, offsetIndex, offsetCount) {
+  const route = autoRoute(relationship, offsetIndex, offsetCount);
+  if (!route) return null;
+
+  const pinned = pinnedPoints(relationship);
+
+  if (!pinned.length) {
+    // Nothing placed by hand. Every corner of the automatic route is still a handle - dragging one
+    // is what turns the whole route manual - but none of them is pinned yet, which is what
+    // `waypointIndex: null` says to the drag.
+    route.manual = false;
+    route.corners = cornersOf(route.points);
+    return route;
+  }
+
+  const points = tidy(chainThrough(route.start, pinned, route.end, route.startSide, route.endSide));
+
+  route.manual = true;
+  route.points = points;
+  route.label = midpointOf(points);
+  route.corners = cornersOf(points);
+
+  return route;
+}
+
+/**
+ * The corners of a connector with one bend taken out of it - or null when that bend cannot go.
+ *
+ * A bend is rarely one corner. A route that steps out of a card, runs across and steps back in has
+ * a corner at each end of the step, and taking out either one on its own puts it straight back:
+ * the router has to turn somewhere to reach the corner that is left. So the corner the user pointed
+ * at is tried on its own and then with each of its neighbours, and the answer is whichever leaves
+ * the fewest turns - or nothing at all, when none of the three does better than the line already
+ * has.
+ *
+ * That last part is the whole point of returning null. A line leaving one card's side and arriving
+ * at another's at a different height has to turn twice and no route exists with fewer, so the menu
+ * item is offered on this answer rather than always: it never appears to do nothing.
+ *
+ * A reduced set that draws the same line the canvas would draw on its own comes back as an empty
+ * list rather than as itself, so taking out the last bend anybody moved hands the connector back to
+ * following its cards.
+ */
+export function cornersWithout(relationship, fanIndex, fanCount, index) {
+  const route = routeRelationship(relationship, fanIndex, fanCount);
+  if (!route) return null;
+
+  const corners = route.corners || [];
+  if (!Number.isInteger(index) || index < 0 || index >= corners.length) return null;
+
+  const baked = corners.map(corner => ({ x: corner.x, y: corner.y }));
+  const tries = [[index], [index - 1, index], [index, index + 1]]
+    .filter(pair => pair.every(at => at >= 0 && at < baked.length));
+
+  const held = relationship.waypoints;
+
+  try {
+    let best = null;
+    let fewest = corners.length;
+
+    for (const pair of tries) {
+      const reduced = baked.filter((point, at) => !pair.includes(at));
+
+      relationship.waypoints = reduced;
+      const after = routeRelationship(relationship, fanIndex, fanCount);
+      if (!after) continue;
+
+      const turns = (after.corners || []).length;
+      if (turns >= fewest) continue;
+
+      fewest = turns;
+      best = { reduced, points: after.points };
+    }
+
+    if (!best) return null;
+
+    relationship.waypoints = [];
+    const automatic = routeRelationship(relationship, fanIndex, fanCount);
+
+    return automatic && samePolyline(automatic.points, best.points) ? [] : best.reduced;
+  } finally {
+    relationship.waypoints = held;
+  }
+}
+
+function samePolyline(a, b) {
+  return a.length === b.length && a.every((point, at) => samePoint(point, b[at]));
+}
+
+/**
+ * The corners the user has placed by hand, in the order the route visits them.
+ *
+ * Guarded exactly as the two offsets are: a coordinate that is NaN or infinite reaches the drawn
+ * points, and from there documentBounds, Fit and every picture export. Neither can be produced by
+ * a drag; both can arrive in a hand-edited or corrupted file.
+ */
+function pinnedPoints(relationship) {
+  const raw = Array.isArray(relationship.waypoints) ? relationship.waypoints : [];
+  const points = [];
+
+  for (const point of raw) {
+    if (!point) continue;
+    const x = Number(point.x);
+    const y = Number(point.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    points.push({ x, y });
+  }
+
+  return points;
+}
+
+/** Which way a connector has to travel to leave a card through a given side. */
+function sideAxis(side) {
+  return side === 'top' || side === 'bottom' ? 'y' : 'x';
+}
+
+function otherAxis(axis) {
+  return axis === 'x' ? 'y' : 'x';
+}
+
+function samePoint(a, b) {
+  return Math.abs(a.x - b.x) < 0.01 && Math.abs(a.y - b.y) < 0.01;
+}
+
+/**
+ * An orthogonal path from one anchor to the other, through every hand-placed corner in turn.
+ *
+ * Three rules, and between them they reproduce every automatic shape exactly when the automatic
+ * shape's own corners are the pinned ones - which is what stops the picture jumping the moment a
+ * drag begins, because that is precisely what the drag pins:
+ *
+ *  - the first leg travels along the axis the start anchor's side faces, so the connector leaves
+ *    the card the way it always has;
+ *  - the last leg travels along the axis the end anchor's side faces, for the same reason;
+ *  - the route turns at every hand-placed corner, so a corner the user put somewhere is a corner
+ *    rather than a bend in a straight run - and, more to the point, the line does not travel out
+ *    to it and straight back the way it came.
+ *
+ * The last hop is the only place those pull against each other. Two legs can turn at the corner or
+ * arrive along the right axis, not always both; when they cannot do both it takes three, turning
+ * at the corner, crossing, and coming in to the card the way the card's side requires. Without
+ * that, a corner dragged well clear of the row it belongs to was reached by a leg that doubled
+ * straight back on itself - which tidy then removed as a straight run, silently throwing the
+ * corner away and leaving the line where it had been before the drag.
+ */
+function chainThrough(start, pinned, end, startSide, endSide) {
+  const startAxis = sideAxis(startSide);
+  const endAxis = sideAxis(endSide);
+
+  // How much clear ground a step away from either card has to work with: the distance between the
+  // two anchors along the axis that step travels on. Half of it at most, so a step out of one card
+  // cannot land inside the other when the two are nearly touching.
+  const startRoom = startAxis === 'x' ? end.x - start.x : end.y - start.y;
+  const endRoom = endAxis === 'x' ? end.x - start.x : end.y - start.y;
+
+  const points = [{ x: start.x, y: start.y }];
+  const stops = pinned.map((point, index) => ({ x: point.x, y: point.y, pin: index }));
+  stops.push({ x: end.x, y: end.y, pin: null });
+
+  let from = points[0];
+  let incoming = null;
+
+  for (let i = 0; i < stops.length; i++) {
+    const to = stops[i];
+    const last = i === stops.length - 1;
+
+    // The hop's first leg. The second is always the other axis, so a hop of two legs arrives along
+    // whichever axis this one is not.
+    const leave = i === 0 ? startAxis : otherAxis(incoming);
+
+    let bends;
+
+    if (last && i > 0 && leave === endAxis) {
+      // Turning here would arrive across the card's side rather than into it, and not turning
+      // would double back along the leg that got here. Three legs do both.
+      //
+      // The crossing point is halfway between, unless the two are already in line - then halfway
+      // is on top of both of them, every bend collapses, and what is left is one leg running along
+      // the card's edge into an anchor whose marker points out sideways. A step clear of the card
+      // is the shape that leaves through the side it says it leaves through.
+      bends = threeLegBends(from, to, endAxis, endSide, endRoom);
+    } else {
+      bends = [leave === 'x' ? { x: to.x, y: from.y } : { x: from.x, y: to.y }];
+
+      // The same collapse at the other end: a first corner sitting exactly on the anchor's own
+      // line leaves the bend on top of the anchor, and the connector sets off along the card's
+      // edge rather than out of it.
+      if (i === 0 && samePoint(bends[0], from)) {
+        bends = stepOut(from, to, startAxis, startSide, startRoom);
+      }
+    }
+
+    // A bend sitting on either end of its own hop is not a corner, and pushing it would put a
+    // duplicate point next to a pinned one - which tidy then drops in favour of the *untagged*
+    // copy, leaving two handles on one point: one that moves the pinned corner and one that
+    // inserts a second corner beside it.
+    let cursor = from;
+
+    for (const bend of bends) {
+      if (samePoint(bend, cursor) || samePoint(bend, to)) continue;
+      bend.hop = to.pin === null ? pinned.length : to.pin;
+      points.push(bend);
+      cursor = bend;
+    }
+
+    const landing = { x: to.x, y: to.y };
+    if (to.pin !== null) landing.pin = to.pin;
+    points.push(landing);
+
+    // Which way the route was travelling as it arrived, so the next hop can turn away from it.
+    // Read off the last leg actually drawn rather than assumed from the shape: a hop whose bends
+    // collapsed is a single leg, and it is that leg the next hop has to turn away from.
+    incoming = Math.abs(to.x - cursor.x) > Math.abs(to.y - cursor.y) ? 'x' : 'y';
+    from = landing;
+  }
+
+  return points;
+}
+
+/**
+ * How far a route steps clear of a card before turning, when it has nowhere else to turn - and
+ * never more than half the gap to the card at the other end, or the step lands inside it and the
+ * connector is drawn across a table.
+ */
+const ANCHOR_STEP = 18;
+
+function anchorStep(room) {
+  return Math.max(2, Math.min(ANCHOR_STEP, Math.abs(room) / 2));
+}
+
+/** Which way is away from the card, along the axis a side faces. */
+function outward(side) {
+  return side === 'right' || side === 'bottom' ? 1 : -1;
+}
+
+/**
+ * The three bends that turn at `from`, cross, and come in to `to` along the end card's own axis.
+ * Falls back to a step clear of the card when the two points are already in line, because halfway
+ * between them is then on top of both.
+ */
+function threeLegBends(from, to, endAxis, endSide, room) {
+  if (endAxis === 'x') {
+    const span = to.x - from.x;
+    const cross = Math.abs(span) < 0.01
+      ? to.x + anchorStep(room) * outward(endSide) : from.x + span / 2;
+    return [{ x: cross, y: from.y }, { x: cross, y: to.y }];
+  }
+
+  const span = to.y - from.y;
+  const cross = Math.abs(span) < 0.01
+    ? to.y + anchorStep(room) * outward(endSide) : from.y + span / 2;
+  return [{ x: from.x, y: cross }, { x: to.x, y: cross }];
+}
+
+/**
+ * The two bends that take a route out of a card's side and then round to a corner sitting on the
+ * anchor's own line - where the ordinary single bend would land on the anchor itself and the
+ * connector would set off along the card's edge.
+ */
+function stepOut(from, to, startAxis, startSide, room) {
+  const step = anchorStep(room) * outward(startSide);
+
+  return startAxis === 'x'
+    ? [{ x: from.x + step, y: from.y }, { x: from.x + step, y: to.y }]
+    : [{ x: from.x, y: from.y + step }, { x: to.x, y: from.y + step }];
+}
+
+/**
+ * Every corner of the drawn route, in drawing order, with which way it can be dragged.
+ *
+ * Exactly one corner per interior point of the drawn line, in the same order: `corners[i]` is
+ * `points[i + 1]`, always. Everything about a corner drag is built on that - the drag bakes the
+ * corners as the route's points and then moves one of them by index - so nothing here may drop,
+ * merge or reorder an entry.
+ *
+ * `waypointIndex` says whether this corner is one the user has placed or one the router turned to
+ * reach them, which is all the drawing uses it for. A drag does not care: it works on the route as
+ * it is drawn, whichever of the two it grabbed.
+ */
+function cornersOf(points) {
+  // Which way a corner can go, and which of its neighbours comes with it.
+  //
+  // Dragging a corner moves the two legs that meet at it and nothing else - that is what makes it
+  // a move rather than a new bend. A move along x carries the leg lying *across* x, the vertical
+  // one, so both ends of that leg travel together; a move along y carries the horizontal one. A leg
+  // whose far end is one of the two anchors cannot move at all, because that end is sitting on the
+  // column the relationship points at - so a corner next to an anchor slides on one axis only, and
+  // a corner with an anchor on both sides does not move at all and is not given a handle.
+  const freedom = at => {
+    // Moving along x slides the leg lying across x - the vertical one - and every point on it
+    // travels together. "The leg" is the whole run of points sharing that x, not just the one
+    // neighbour: three points in a line are one leg with a redundant point in the middle, and
+    // moving two of the three would bend it.
+    //
+    // An anchor anywhere in the run freezes the lot. It is sitting on the column the relationship
+    // points at, so it cannot travel - and dragging the rest of the run without it is exactly the
+    // "it drags the line out and creates an additional bend" this gesture exists not to do.
+    const along = axis => {
+      const value = points[at][axis];
+
+      let low = at;
+      let high = at;
+      while (low > 0 && Math.abs(points[low - 1][axis] - value) < 0.01) low--;
+      while (high < points.length - 1 && Math.abs(points[high + 1][axis] - value) < 0.01) high++;
+
+      if (low === high) return null;
+      if (low === 0 || high === points.length - 1) return null;
+
+      const carried = [];
+      for (let i = low; i <= high; i++) {
+        if (i !== at) carried.push(i - 1);
+      }
+
+      return carried;
+    };
+
+    return { carryX: along('x'), carryY: along('y') };
+  };
+
+  const corners = [];
+
+  for (let i = 1; i < points.length - 1; i++) {
+    const point = points[i];
+    const free = freedom(i);
+
+    corners.push({
+      x: point.x, y: point.y,
+      waypointIndex: Number.isInteger(point.pin) ? point.pin : null,
+      carryX: free.carryX,
+      carryY: free.carryY
+    });
+  }
+
+  return corners;
+}
+
+/**
+ * The route the canvas works out for itself: the path points, the two end anchors, the side each
+ * anchor sits on so markers can be oriented, and which axis each of the two manual offsets moves
+ * the route along.
+ *
+ * End anchors never move with either offset: dragging a connector separates it from the ones it
+ * overlaps without changing what either end points at.
+ */
+function autoRoute(relationship, offsetIndex, offsetCount) {
   const from = tableById(relationship.fromTableId);
   const to = tableById(relationship.toTableId);
   if (!from || !to) return null;
@@ -662,10 +1191,14 @@ export function routeRelationship(relationship, offsetIndex, offsetCount) {
   const b = tableRect(to);
 
   const spread = ((offsetIndex || 0) - ((offsetCount || 1) - 1) / 2) * METRICS.connectorGap;
-  const manual = Number(relationship.routeOffset) || 0;
-  const nudge = spread + manual;
 
-  if (from.id === to.id) return selfLoop(a, spread, manual);
+  // `Number(x) || 0` turns NaN into zero and leaves Infinity alone, and an infinite offset reaches
+  // documentBounds, which then hands Fit and every picture export an infinite drawing to lay out.
+  // Neither value can be produced by a drag; both can arrive in a hand-edited or corrupted file.
+  const along = finite(relationship.routeOffset);
+  const across = finite(relationship.routeOffsetCross);
+
+  if (from.id === to.id) return selfLoop(a, spread, along);
 
   const aCentre = { x: a.x + a.width / 2, y: a.y + a.height / 2 };
   const bCentre = { x: b.x + b.width / 2, y: b.y + b.height / 2 };
@@ -673,61 +1206,209 @@ export function routeRelationship(relationship, offsetIndex, offsetCount) {
   const dx = bCentre.x - aCentre.x;
   const dy = bCentre.y - aCentre.y;
 
-  const horizontal = Math.abs(dx) >= Math.abs(dy);
+  // Only a proposal gets the primary-key fallback at its one end - see rowAnchor.
+  const derivedKey = relationship.status === 'Proposed';
+  const goingRight = dx >= 0;
 
-  if (horizontal) {
-    const goingRight = dx >= 0;
+  const startY = anchorY(a, relationship.referencedAttribute, derivedKey);
+  const endY = anchorY(b, relationship.referencingAttribute, false);
 
-    // Only a proposal gets the primary-key fallback at its one end - see anchorY. A vertical route
-    // meets the top or bottom edge of a card and has never pointed at a row at all, so this is the
-    // one branch it can apply to.
-    const derivedKey = relationship.status === 'Proposed';
+  // Clear space between the two cards, which is where a side-to-side route puts its middle segment.
+  const between = goingRight ? b.x - (a.x + a.width) : a.x - (b.x + b.width);
 
-    const start = { x: goingRight ? a.x + a.width : a.x, y: anchorY(a, relationship.referencedAttribute, derivedKey) };
-    const end = { x: goingRight ? b.x : b.x + b.width, y: anchorY(b, relationship.referencingAttribute) };
-
-    const level = Math.abs(start.y - end.y) < 0.5;
-    let points;
-    let offsetAxis;
-
-    if (level) {
-      // A dead-straight run has no middle segment to shift sideways, so the offset lifts the
-      // span instead. Two connectors that would sit exactly on top of each other can be parted.
-      offsetAxis = 'y';
-      if (Math.abs(nudge) < 0.5) {
-        points = [start, end];
-      } else {
-        const direction = goingRight ? 1 : -1;
-        const stub = Math.max(14, Math.min(34, Math.abs(end.x - start.x) / 3));
-        const x1 = start.x + stub * direction;
-        const x2 = end.x - stub * direction;
-        points = [
-          start,
-          { x: x1, y: start.y },
-          { x: x1, y: start.y + nudge },
-          { x: x2, y: end.y + nudge },
-          { x: x2, y: end.y },
-          end
-        ];
-      }
-    } else {
-      offsetAxis = 'x';
-      const midX = clampBetween((start.x + end.x) / 2 + nudge, start.x + 12, end.x - 12 * (goingRight ? 1 : -1));
-      points = [start, { x: midX, y: start.y }, { x: midX, y: end.y }, end];
-    }
-
-    return {
-      points,
-      start,
-      end,
-      startSide: goingRight ? 'right' : 'left',
-      endSide: goingRight ? 'left' : 'right',
-      offsetAxis,
-      label: midpointOf(points)
-    };
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    // Cards that overlap each other have no space between them at all, and the clamp that keeps the
+    // middle segment between them then has nothing to clamp to: every leg of the route was drawn
+    // inside one card or the other. Dropping one card on top of another is a single gesture, so
+    // this is somewhere a diagram really goes; round the outside is the honest drawing for it.
+    return between < 0
+      ? sameSideRoute(a, b, startY, endY, spread, along)
+      : sideToSideRoute(a, b, startY, endY, goingRight, spread, along, across);
   }
 
-  const goingDown = dy >= 0;
+  // A run between cards stacked one above the other used to meet the top or bottom edge, and no
+  // point along that edge can pick out a row - the rows are stacked in the same direction, so the
+  // line pointed at the table and said nothing about which lookup it was. When either end has its
+  // column drawn, the connector leaves through the *side* instead and goes on pointing at the row.
+  //
+  // Only then. A card showing no columns has nothing to point at, and the straight top-to-bottom
+  // run is the better drawing for it, so that is what it keeps.
+  const rowA = rowAnchor(a, relationship.referencedAttribute, derivedKey);
+  const rowB = rowAnchor(b, relationship.referencingAttribute, false);
+
+  if (rowA !== null || rowB !== null) {
+    // Stacked cards have no room between them to turn in, so those go round the outside.
+    return between >= SIDE_ROUTE_CLEARANCE
+      ? sideToSideRoute(a, b, startY, endY, goingRight, spread, along, across)
+      : sameSideRoute(a, b, startY, endY, spread, along);
+  }
+
+  return topToBottomRoute(a, b, aCentre, bCentre, dy >= 0, spread, along, across);
+}
+
+/** A usable number, or zero. Guards the route against NaN and against infinity alike. */
+function finite(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * The ordinary route: out of one card's side, across, into the other card's facing side.
+ *
+ * `along` moves the middle segment, which is what a drag has always done. `across` moves the whole
+ * middle of the route the other way and joins it back to the two anchors with a short step at each
+ * end - so both offsets together can take a connector out of a bundle of overlapping lines without
+ * either end stopping pointing at its column. At zero the steps have no length and the shape
+ * collapses back to the three-segment run, which is why the picture does not jump as a drag
+ * crosses the axis.
+ */
+function sideToSideRoute(a, b, startY, endY, goingRight, spread, along, across) {
+  const start = { x: goingRight ? a.x + a.width : a.x, y: startY };
+  const end = { x: goingRight ? b.x : b.x + b.width, y: endY };
+
+  const direction = goingRight ? 1 : -1;
+  const stub = Math.max(14, Math.min(34, Math.abs(end.x - start.x) / 3));
+
+  // The same tolerance tidy uses, and it has to be. The level branch treats the two anchors as
+  // being at one height and draws the middle of the route between `start.y + lift` and
+  // `end.y + lift`; at a wider tolerance a pair of cards half a unit apart - a hand-edited file, or
+  // an older auto-layout - took that branch and got a leg that was neither horizontal nor vertical.
+  // A diagonal leg is not just ugly: crossingPoints only recognises a horizontal leg, so it gets no
+  // bridge where it crosses another connector and none is drawn over it either.
+  const level = Math.abs(start.y - end.y) < 0.01;
+
+  let points;
+  let offsetAxis;
+  let crossAxis;
+
+  if (level) {
+    // A dead-straight run has no middle segment to shift sideways, so the offset lifts the span
+    // instead. Two connectors that would sit exactly on top of each other can be parted.
+    offsetAxis = 'y';
+    crossAxis = 'x';
+
+    const lift = along + spread;
+
+    if (Math.abs(lift) < 0.5) {
+      // Still a straight line between the two anchors. The cross offset has nothing to move *yet*,
+      // but the axis is still reported: a drag that takes the line off the straight run and slides
+      // it along in one gesture is one gesture, and freezing the axis at the moment of the press
+      // threw away half of every such drag.
+      points = [start, end];
+    } else {
+      const x1 = clampBetween(start.x + stub * direction + across, start.x, end.x);
+      const x2 = clampBetween(end.x - stub * direction + across, start.x, end.x);
+
+      points = [
+        start,
+        { x: x1, y: start.y },
+        { x: x1, y: start.y + lift },
+        { x: x2, y: end.y + lift },
+        { x: x2, y: end.y },
+        end
+      ];
+    }
+  } else {
+    offsetAxis = 'x';
+    crossAxis = 'y';
+
+    // Both bounds are direction-corrected. The low one was not, and going right to left `start.x`
+    // is the source card's *left* edge, so the range ran from 12 units inside that card: a dragged
+    // connector left the card's left edge travelling right, back underneath the card it had just
+    // come out of, with its middle segment drawn through it.
+    const midX = clampBetween((start.x + end.x) / 2 + along + spread,
+      start.x + 12 * direction, end.x - 12 * direction);
+
+    if (Math.abs(across) < 0.5) {
+      points = [start, { x: midX, y: start.y }, { x: midX, y: end.y }, end];
+    } else {
+      const x1 = clampBetween(start.x + stub * direction, start.x, midX);
+      const x2 = clampBetween(end.x - stub * direction, midX, end.x);
+
+      points = [
+        start,
+        { x: x1, y: start.y },
+        { x: x1, y: start.y + across },
+        { x: midX, y: start.y + across },
+        { x: midX, y: end.y + across },
+        { x: x2, y: end.y + across },
+        { x: x2, y: end.y },
+        end
+      ];
+    }
+  }
+
+  points = tidy(points);
+
+  return {
+    points,
+    start,
+    end,
+    startSide: goingRight ? 'right' : 'left',
+    endSide: goingRight ? 'left' : 'right',
+    offsetAxis,
+    crossAxis,
+    label: midpointOf(points)
+  };
+}
+
+/**
+ * Two cards stacked one above the other, both ends pointing at a row. Both connectors leave
+ * through the same side and the route runs down a lane just outside them.
+ *
+ * One degree of freedom rather than two: the lane is the only part of this shape that can move.
+ * The two arms are at the rows they point at, and moving either of those is exactly what the whole
+ * route exists to avoid.
+ */
+function sameSideRoute(a, b, startY, endY, spread, along) {
+  const aRight = a.x + a.width;
+  const bRight = b.x + b.width;
+
+  // Round whichever side gives the shorter pair of arms, so the lane hugs the cards rather than
+  // reaching across the whole of the wider one.
+  const outerRight = Math.max(aRight, bRight);
+  const outerLeft = Math.min(a.x, b.x);
+  const rightCost = (outerRight - aRight) + (outerRight - bRight);
+  const leftCost = (a.x - outerLeft) + (b.x - outerLeft);
+  const side = leftCost < rightCost ? 'left' : 'right';
+
+  const direction = side === 'right' ? 1 : -1;
+  const start = { x: side === 'right' ? aRight : a.x, y: startY };
+  const end = { x: side === 'right' ? bRight : b.x, y: endY };
+  const outer = side === 'right' ? outerRight : outerLeft;
+
+  // `along` is a drag in screen x, so it moves the lane the way the pointer went whichever side
+  // the lane is on. The spread fans parallel connectors away from the cards.
+  let lane = outer + (METRICS.channel + spread) * direction + along;
+  lane = side === 'right' ? Math.max(lane, outer + 12) : Math.min(lane, outer - 12);
+
+  // Two anchors at the same height collapse this to the straight line between them, which crosses
+  // whatever lies between the two cards. That is not a case worth routing around: the arms have to
+  // arrive at their rows horizontally, so *every* orthogonal route into an anchor at that height
+  // crosses the same ground, and the straight line is the shortest of them. It only arises when one
+  // card has been dropped on another, which is a thing to fix by moving the card.
+  const points = tidy([start, { x: lane, y: start.y }, { x: lane, y: end.y }, end]);
+
+  return {
+    points,
+    start,
+    end,
+    startSide: side,
+    endSide: side,
+    offsetAxis: 'x',
+    crossAxis: null,
+    label: midpointOf(points)
+  };
+}
+
+/**
+ * Straight down from one card's bottom edge into the other card's top edge. What a vertical run
+ * looks like when neither end has a row to point at.
+ *
+ * The two offsets work the same way round as they do side to side: `along` moves the middle
+ * segment, `across` moves the whole middle of the route the other way with a step at each end.
+ */
+function topToBottomRoute(a, b, aCentre, bCentre, goingDown, spread, along, across) {
   const start = {
     x: clampToRect(aCentre.x + spread, a.x, a.x + a.width),
     y: goingDown ? a.y + a.height : a.y
@@ -737,33 +1418,63 @@ export function routeRelationship(relationship, offsetIndex, offsetCount) {
     y: goingDown ? b.y : b.y + b.height
   };
 
-  const level = Math.abs(start.x - end.x) < 0.5;
+  const direction = goingDown ? 1 : -1;
+  const stub = Math.max(14, Math.min(34, Math.abs(end.y - start.y) / 3));
+  const level = Math.abs(start.x - end.x) < 0.01;   // see sideToSideRoute
+
   let points;
   let offsetAxis;
+  let crossAxis;
 
   if (level) {
     offsetAxis = 'x';
-    if (Math.abs(manual) < 0.5) {
-      points = [start, end];
+    crossAxis = 'y';
+
+    if (Math.abs(along) < 0.5) {
+      points = [start, end];   // see sideToSideRoute: the cross axis is still reported
     } else {
-      const direction = goingDown ? 1 : -1;
-      const stub = Math.max(14, Math.min(34, Math.abs(end.y - start.y) / 3));
-      const y1 = start.y + stub * direction;
-      const y2 = end.y - stub * direction;
+      const y1 = clampBetween(start.y + stub * direction + across, start.y, end.y);
+      const y2 = clampBetween(end.y - stub * direction + across, start.y, end.y);
+
       points = [
         start,
         { x: start.x, y: y1 },
-        { x: start.x + manual, y: y1 },
-        { x: end.x + manual, y: y2 },
+        { x: start.x + along, y: y1 },
+        { x: end.x + along, y: y2 },
         { x: end.x, y: y2 },
         end
       ];
     }
   } else {
     offsetAxis = 'y';
-    const midY = clampBetween((start.y + end.y) / 2 + nudge, start.y + 12, end.y - 12 * (goingDown ? 1 : -1));
-    points = [start, { x: start.x, y: midY }, { x: end.x, y: midY }, end];
+    crossAxis = 'x';
+
+    // Both bounds direction-corrected, for the reason given against midX in sideToSideRoute: a run
+    // going upward starts at the card's *bottom* edge, so an uncorrected low bound put the middle
+    // segment 12 units inside the card the connector had just left.
+    const midY = clampBetween((start.y + end.y) / 2 + along + spread,
+      start.y + 12 * direction, end.y - 12 * direction);
+
+    if (Math.abs(across) < 0.5) {
+      points = [start, { x: start.x, y: midY }, { x: end.x, y: midY }, end];
+    } else {
+      const y1 = clampBetween(start.y + stub * direction, start.y, midY);
+      const y2 = clampBetween(end.y - stub * direction, midY, end.y);
+
+      points = [
+        start,
+        { x: start.x, y: y1 },
+        { x: start.x + across, y: y1 },
+        { x: start.x + across, y: midY },
+        { x: end.x + across, y: midY },
+        { x: end.x + across, y: y2 },
+        { x: end.x, y: y2 },
+        end
+      ];
+    }
   }
+
+  points = tidy(points);
 
   return {
     points,
@@ -772,6 +1483,7 @@ export function routeRelationship(relationship, offsetIndex, offsetCount) {
     startSide: goingDown ? 'bottom' : 'top',
     endSide: goingDown ? 'top' : 'bottom',
     offsetAxis,
+    crossAxis,
     label: midpointOf(points)
   };
 }
@@ -796,6 +1508,7 @@ function selfLoop(rect, spread, manual) {
     startSide: 'right',
     endSide: 'right',
     offsetAxis: 'x',
+    crossAxis: null,
     label: { x: right + out + 6, y: (top + bottom) / 2 }
   };
 }

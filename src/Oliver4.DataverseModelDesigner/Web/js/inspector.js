@@ -4,7 +4,7 @@ import { el, clear, $, formatDateTime } from './util.js';
 import {
   state, mutate, setDirty, tableById, relationshipById, annotationById, subscribe,
   removeTable, removeRelationship, removeAnnotation, clearSelection, effectiveDetail,
-  annotationKind, annotationBehind, syncProposedLookupColumn, NOTE_DEFAULT_SIZE
+  annotationKind, annotationBehind, syncProposedLookupColumn, clearManualRoute, NOTE_DEFAULT_SIZE
 } from './state.js';
 import { render } from './render.js';
 import { renderPanels } from './panels.js';
@@ -12,7 +12,7 @@ import { field, textInput, textArea, select, checkbox, statusBadge, toast } from
 import { focusTable } from './interact.js';
 import { EMPHASIS_COLOURS, emphasisHead, emphasisName } from './theme.js';
 import { openProposedTableEditor, openProposedColumnEditor, removeProposedColumn } from './proposed.js';
-import { invalidateSizes, visibleColumns, stickyTilt } from './geometry.js';
+import { invalidateSizes, visibleColumns, orderedColumns, stickyTilt } from './geometry.js';
 
 export function initInspector() {
   $('#inspector-close').addEventListener('click', hideInspector);
@@ -439,6 +439,9 @@ function proposedRelationshipEditor(relationship) {
         mutate('relationship end', () => {
           relationship.fromTableId = value;
           syncProposedLookupColumn(relationship);
+
+          // The corners the user placed were placed around the cards this connector used to join.
+          clearManualRoute(relationship);
         });
         applied();
       })),
@@ -446,6 +449,7 @@ function proposedRelationshipEditor(relationship) {
         mutate('relationship end', () => {
           relationship.toTableId = value;
           syncProposedLookupColumn(relationship);
+          clearManualRoute(relationship);
         });
         applied();
       }))
@@ -716,7 +720,9 @@ function columnSelector(table) {
     const term = search.value.toLowerCase();
     const drawn = new Set(visibleColumns(table).map(column => column.id));
 
-    for (const column of table.columns) {
+    // In the order the card draws them, not the order the metadata lists them. The two are the same
+    // until a row is dragged, and after that this list was describing a card that was not on screen.
+    for (const column of orderedColumns(table)) {
       const label = (column.displayName || '') + ' ' + (column.logicalName || '');
       if (term && !label.toLowerCase().includes(term)) continue;
 

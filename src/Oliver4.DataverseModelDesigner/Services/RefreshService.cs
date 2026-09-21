@@ -820,8 +820,22 @@ namespace Oliver4.DataverseModelDesigner.Services
                 return;
             }
 
+            // The corners a user placed by hand were placed around the shape the connector had
+            // while it ran the other way. Visited in the order they are held in, a reversed route
+            // draws back over itself, so the routing goes with the ends; the automatic route is the
+            // only honest drawing of a connector whose two ends have just changed places.
+            var repointed = !string.Equals(relationship.FromTableId, referenced.Id, StringComparison.Ordinal)
+                || !string.Equals(relationship.ToTableId, referencing.Id, StringComparison.Ordinal);
+
             relationship.FromTableId = referenced.Id;
             relationship.ToTableId = referencing.Id;
+
+            if (repointed)
+            {
+                relationship.Waypoints = new List<PointD>();
+                relationship.RouteOffset = 0;
+                relationship.RouteOffsetCross = 0;
+            }
 
             SettleOwnedLookup(document, relationship, match.ReferencingAttribute);
             relationship.ReferencingAttribute = match.ReferencingAttribute;

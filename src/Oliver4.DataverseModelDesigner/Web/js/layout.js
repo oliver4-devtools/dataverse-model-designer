@@ -5,7 +5,7 @@
 // pass produces something an architect recognises. Disconnected tables are packed into a grid
 // beside the graph rather than scattered through it.
 
-import { state, tableById, visibleRelationships } from './state.js';
+import { state, tableById, visibleRelationships, clearManualRoute } from './state.js';
 import { measureTable } from './geometry.js';
 
 const GAP_X = 90;
@@ -23,12 +23,23 @@ const COMPONENT_GAP = 90;
  *               going into a landscape document.
  */
 export function applyLayout(mode) {
+  if (mode === 'Manual') return;
+
+  // Every card is about to move, and a connector's hand-placed corners are absolute canvas
+  // coordinates: left alone they hold the line at points the cards have gone from, so a diagram
+  // somebody spent ten minutes untangling comes back worse than it started, with lines detouring
+  // hundreds of units to nothing. The two offsets go with them - they are measured from the
+  // automatic route, which is about to be a different shape.
+  //
+  // Undo puts the whole rearrangement back, routing included, because this runs inside the same
+  // mutate as the layout itself.
+  for (const relationship of state.doc.relationships) clearManualRoute(relationship);
+
   switch (mode) {
     case 'Grid': return gridLayout();
     case 'Horizontal': return layeredLayout('LR', { align: 'start' });
     case 'Vertical': return layeredLayout('TB');
     case 'Hierarchical': return layeredLayout('TB', { strictHierarchy: true });
-    case 'Manual': return;
     default: return layeredLayout('LR');
   }
 }

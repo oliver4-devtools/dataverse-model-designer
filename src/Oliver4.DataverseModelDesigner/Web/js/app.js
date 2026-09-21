@@ -8,7 +8,7 @@ import {
   removeTable, removeRelationship, removeAnnotation, notify, newAnnotation,
   syncProposedLookupColumn, annotationBehind, NOTE_DEFAULT_SIZE
 } from './state.js';
-import { initRenderer, render, refreshRendererTheme } from './render.js';
+import { initRenderer, render, refreshRendererTheme, routeFor } from './render.js';
 import {
   initInteractions, fitToView, zoomStep, resetZoom, resetView, zoomTo, focusTable, deleteSelection,
   toWorld, startConnectMode, startDrawMode, endDrawMode, isTypingTarget
@@ -32,7 +32,7 @@ import { runRefresh } from './refresh.js';
 import {
   openDisplaySettings, openDiagramProperties, openPathFinder, openLayoutMenu, openFeatureGuide
 } from './dialogs.js';
-import { invalidateSizes, statusStyle } from './geometry.js';
+import { invalidateSizes, statusStyle, cornersWithout } from './geometry.js';
 import { setTheme, currentTheme, emphasisHead, emphasisName } from './theme.js';
 
 // ------------------------------------------------------------------ boot --
@@ -125,9 +125,6 @@ let legendDrag = null;
 
 /** The last placement applied to the legend, so paintChrome does not re-measure it every time. */
 let lastLegendPlacement = null;
-
-/** Set by a legend drag so the click it ends with does not also fire the control underneath. */
-let legendClickSuppressed = false;
 
 /**
  * Space kept clear above the legend, matching TOP_CHROME_HEIGHT in render.js.
@@ -469,7 +466,10 @@ function paintLegend() {
     const row = legendRow(swatch, emphasisName(colour));
     row.classList.add('legend-named');
     row.title = 'Click to name this colour';
-    row.addEventListener('click', () => renameEmphasis(colour));
+
+    // The colour is read back off the row by the drag below rather than closed over by a click
+    // listener here. See initLegendDrag for why a click listener on this row never ran.
+    row.setAttribute('data-emphasis', colour);
     rows.appendChild(row);
   }
 
@@ -506,20 +506,18 @@ function initLegendDrag() {
     if (event.button !== 0) return;
 
     const rect = legend.getBoundingClientRect();
+    const row = event.target && event.target.closest ? event.target.closest('.legend-named') : null;
 
     legendDrag = {
       pointerId: event.pointerId,
       startX: event.clientX, startY: event.clientY,
       originX: rect.left, originY: rect.top,
-      moved: false, at: null
-    };
+      moved: false, at: null,
 
-    // Same as every canvas drag. Without it a release outside the WebView never arrives, and the
-    // legend goes on following the pointer the next time it crosses the window with no button
-    // held down.
-    if (legend.setPointerCapture) {
-      try { legend.setPointerCapture(event.pointerId); } catch (e) { /* not fatal */ }
-    }
+      // The row the press landed on, if it was one. Captured here because by the time the button
+      // comes up the pointer may be somewhere else entirely.
+      colour: row ? row.getAttribute('data-emphasis') : null
+    };
   });
 
   // On the window rather than on the legend: a pointer that leaves the legend mid-drag - which it
@@ -544,25 +542,6 @@ function initLegendDrag() {
     showLegendMenu(event);
   });
 
-  // A drag that finishes over a named colour row is still a click on that row, so without this
-  // the rename dialog opened every time the legend was moved by one of its own labels. Capturing,
-  // so it runs before the row's own handler.
-  //
-  // On the window rather than on the legend. A click is dispatched on the nearest ancestor of the
-  // press and the release, so a drag that ends with the pointer off the legend - which is what
-  // every drag into a corner does, because the legend stops at the clamp while the pointer carries
-  // on - fires its click on the body and never reaches a listener on the legend. The flag then
-  // stayed armed and silently swallowed the *next* real click on a colour row.
-  window.addEventListener('click', event => {
-    if (!legendClickSuppressed) return;
-    legendClickSuppressed = false;
-
-    const target = event.target;
-    if (!target || !target.closest || !target.closest('#legend')) return;
-
-    event.stopPropagation();
-    event.preventDefault();
-  }, true);
 }
 
 /** Drops a drag in progress without committing it, and puts the legend back where it was. */
@@ -570,7 +549,6 @@ function cancelLegendDrag() {
   if (!legendDrag) return;
 
   legendDrag = null;
-  legendClickSuppressed = false;
 
   const legend = $('#legend');
   if (legend) legend.classList.remove('is-dragging');
@@ -603,7 +581,23 @@ function onLegendPointerMove(event) {
   if (!legendDrag.moved) {
     if (Math.abs(dx) < 3 && Math.abs(dy) < 3) return;
     legendDrag.moved = true;
-    $('#legend').classList.add('is-dragging');
+
+    const legend = $('#legend');
+    legend.classList.add('is-dragging');
+
+    // Here rather than on pointerdown, which is where it used to be.
+    //
+    // Capture is what makes a release outside the WebView arrive, so a drag needs it or the legend
+    // goes on following the pointer the next time it crosses the window with no button held down.
+    // But while an element holds the capture the browser also retargets the *click* to it, so with
+    // it taken on every press the click from a plain press-and-release landed on #legend rather
+    // than on the row inside it - and the listener on the row that opened the rename dialog was
+    // never called. That is why the pencil on a colour row did nothing from 1.8.0 onwards.
+    //
+    // Taken once the press has become a drag, so the press that is only a press never has it.
+    if (legend.setPointerCapture && legendDrag.pointerId !== undefined) {
+      try { legend.setPointerCapture(legendDrag.pointerId); } catch (e) { /* not fatal */ }
+    }
   }
 
   event.preventDefault();
@@ -625,9 +619,15 @@ function onLegendPointerUp(event) {
   const legend = $('#legend');
   if (legend) legend.classList.remove('is-dragging');
 
-  if (!drag.moved || !drag.at) return;
+  // A press that never became a drag is a click on whatever it went down on. Acted on here rather
+  // than in a click listener: see the capture note in onLegendPointerMove for why a click on a row
+  // inside the legend cannot be relied on to reach that row.
+  if (!drag.moved) {
+    if (drag.colour) renameEmphasis(drag.colour);
+    return;
+  }
 
-  legendClickSuppressed = true;
+  if (!drag.at) return;
 
   // Committed as one undoable step, like every other drag on the canvas. The clamped point is
   // what is stored, because that is where the legend actually is.
@@ -1008,6 +1008,98 @@ function stepHistory(step) {
   invalidateSizes();
   render();
   renderPanels();
+  refreshInspector();
+}
+
+/**
+ * Which corner of a connector the right-click landed on, or null when it did not land on one or
+ * that bend is not the user's to remove.
+ *
+ * The handles sit in the overlay layer above everything else, so a right-click on one has the
+ * handle as its target while the hit test underneath still resolves to the connector - which is
+ * what puts the item on that connector's own menu rather than on a menu of its own.
+ */
+function bendUnderPointer(event, relationshipId) {
+  const handle = event && event.target && event.target.closest
+    ? event.target.closest('[data-corner]') : null;
+  if (!handle) return null;
+
+  // The handle has to belong to the connector whose menu this is. They are resolved separately -
+  // the handle by its own attribute, the menu by the hit test - and a corner of one connector is
+  // not a bend anybody can take out of another.
+  if (handle.getAttribute('data-id') !== relationshipId) return null;
+
+  const relationship = relationshipById(relationshipId);
+  const route = relationship ? routeFor(relationshipId) : null;
+  if (!route) return null;
+
+  const index = Number(handle.getAttribute('data-corner'));
+  return cornersWithout(relationship, route.fanIndex, route.fanCount, index) === null ? null : index;
+}
+
+/** Takes one bend out of a connector, leaving the rest of the route where the user put it. */
+function removeBend(relationshipId, index) {
+  const relationship = relationshipById(relationshipId);
+  const route = relationship ? routeFor(relationshipId) : null;
+  if (!route) return;
+
+  const reduced = cornersWithout(relationship, route.fanIndex, route.fanCount, index);
+  if (reduced === null) return;
+
+  mutate('remove bend', () => {
+    relationship.waypoints = reduced;
+
+    // The corners the route is drawn through now carry the whole shape, so the two offsets - which
+    // move the middle of an *automatic* route - have nothing left to move and would apply twice.
+    // An empty list means the connector is back on its automatic route, and there they are what
+    // the user last dragged, so they stay.
+    if (reduced.length) {
+      relationship.routeOffset = 0;
+      relationship.routeOffsetCross = 0;
+    }
+  });
+
+  render();
+  refreshInspector();
+}
+
+/**
+ * Whether a connector is carrying any routing of the user's own - either of the two offsets, or a
+ * corner moved by hand. What "Straighten this connector" is offered for, and what it undoes.
+ */
+function handRouted(relationship) {
+  return !!(relationship.routeOffset || relationship.routeOffsetCross ||
+    (Array.isArray(relationship.waypoints) && relationship.waypoints.length));
+}
+
+/** Puts a connector the user has dragged back onto the route the canvas would give it. */
+function straightenConnector(relationshipId) {
+  const relationship = relationshipById(relationshipId);
+  if (!relationship) return;
+  if (!handRouted(relationship)) return;
+
+  mutate('straighten connector', () => {
+    relationship.routeOffset = 0;
+    relationship.routeOffsetCross = 0;
+
+    // The corners the user moved by hand go with the offsets. Straightening is the one way back
+    // from a route that has been shaped corner by corner, so leaving them would make the menu item
+    // do nothing at all on the connectors most likely to need it.
+    relationship.waypoints = [];
+  });
+
+  render();
+  refreshInspector();
+}
+
+/** Puts a card the user has reordered by hand back under the ordinary column-order rules. */
+function resetColumnOrder(tableId) {
+  const table = tableById(tableId);
+  if (!table || !(table.columnOrder || []).length) return;
+
+  mutate('reset column order', () => { table.columnOrder = []; });
+  invalidateSizes();
+  render();
   refreshInspector();
 }
 
@@ -1441,6 +1533,16 @@ function showCanvasMenu(event, hit, worldPoint) {
           const current = tableById(tableId);
           if (current) addAnnotation({ x: current.x, y: current.y - 200 });
         } },
+
+      // The way back from dragging a row. A hand-made order beats both the Column order setting and
+      // the key float, by design - so without this, one nudge on one card meant that Display
+      // settings silently stopped governing that card for the life of the file, with Ctrl+Z at the
+      // moment of the drag as the only way out. Offered only when there is an order to reset, so it
+      // does not read as a command that does nothing.
+      (table.columnOrder || []).length
+        ? { text: 'Reset column order on this card', run: () => resetColumnOrder(tableId) }
+        : null,
+
       { separator: true },
       // Proposing a column or a relationship works on any table, existing ones included: a design
       // nearly always starts by adding something to what is already there.
@@ -1484,6 +1586,11 @@ function showCanvasMenu(event, hit, worldPoint) {
     // An id, not the connector object, for the same reason as the table menu above.
     const relationshipId = relationship.id;
 
+    // Worked out once, here, rather than in the menu item's own closure: by the time that runs the
+    // event is long gone and the route may have been redrawn, and asking twice is two chances to
+    // get two different answers.
+    const bend = bendUnderPointer(event, relationshipId);
+
     showContextMenu(event.clientX, event.clientY, [
       { label: relationship.schemaName || 'Relationship' },
       { text: relationship.hidden ? 'Show connector' : 'Hide connector',
@@ -1494,6 +1601,23 @@ function showCanvasMenu(event, hit, worldPoint) {
         : null,
       { text: 'Add a sticky note about this relationship',
         run: () => addAnnotation(null, relationshipId) },
+
+      // Right-clicked on one of the corner handles, and that bend can go. Offered on the answer
+      // rather than always, so it never appears to do nothing: a line leaving one card's side and
+      // arriving at another's at a different height has to turn twice, and taking one of those two
+      // out only puts it straight back somewhere else.
+      bend !== null
+        ? { text: 'Remove this bend', run: () => removeBend(relationshipId, bend) }
+        : null,
+
+      // The way back from dragging a connector, and the same argument as the card's column order:
+      // a route can be dragged into a shape whose offsets are no longer visible - a pair of cards
+      // restacked since, or a sideways drag on a line that is still dead straight - and without
+      // this, Ctrl+Z at the moment of the drag was the only way to straighten it again.
+      handRouted(relationship)
+        ? { text: 'Straighten this connector', run: () => straightenConnector(relationshipId) }
+        : null,
+
       { separator: true },
       { label: 'Status on this diagram' },
       { text: 'Mark as deprecated', run: () => setRelationshipStatus(relationshipId, 'Deprecated') },

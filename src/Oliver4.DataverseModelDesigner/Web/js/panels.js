@@ -8,6 +8,7 @@ import {
 import { render } from './render.js';
 import { focusTable, fitToView } from './interact.js';
 import { statusBadge } from './ui.js';
+import { emphasisName } from './theme.js';
 
 let activeTab = 'model';
 let searchTerm = '';
@@ -104,7 +105,7 @@ function renderModelTab() {
         renderPanels();
       }
     }, [
-      el('span', { class: 'status-mark st-' + (table.status || 'Existing').toLowerCase() }),
+      tableMark(table),
       el('span', { class: 'row-name', text: table.displayName || table.logicalName }),
       table.missingSinceRefresh ? el('span', { class: 'badge badge-missing', text: 'NOT FOUND' }) : null,
       statusBadge(table.status),
@@ -169,6 +170,32 @@ function renderModelTab() {
 
     container.appendChild(environmentSearchSection());
   }
+}
+
+/**
+ * The mark at the left of a row in the model list.
+ *
+ * It carries the table's emphasis colour when one has been applied, and its status colour when one
+ * has not. A list that painted every table the same blue said nothing about a colour scheme the
+ * user had put on the canvas on purpose - and the legend names those colours, so the list, the
+ * cards and the legend now all agree.
+ *
+ * Status is not lost: the badge further along the same row says it in words, which is the only
+ * thing on the row that says it at all for anyone who cannot tell the two blues apart.
+ */
+function tableMark(table) {
+  const colour = table.highlight;
+  const status = table.status || 'Existing';
+
+  // The tooltip names both. Four of the twelve emphasis colours are the same hex as one of the four
+  // status colours, and a table whose status is Existing carries no badge on its row - so an
+  // Existing table emphasised in red shows the same mark a deprecated one does, and hovering it is
+  // the only way to tell which it is.
+  return el('span', {
+    class: 'status-mark st-' + status.toLowerCase() + (colour ? ' is-emphasis' : ''),
+    style: colour ? { background: colour } : null,
+    title: colour ? emphasisName(colour) + ' \u00b7 ' + status : status
+  });
 }
 
 function tableHaystack(table) {

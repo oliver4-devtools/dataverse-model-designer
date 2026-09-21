@@ -423,6 +423,8 @@ export function addRelationshipsFromMetadata(dtos, options) {
       r.schemaName.toLowerCase() === dto.schemaName.toLowerCase());
 
     if (existing) {
+      const before = { fromTableId: existing.fromTableId, toTableId: existing.toTableId };
+
       Object.assign(existing, {
         displayName: dto.displayName,
         metadataId: dto.metadataId,
@@ -441,6 +443,14 @@ export function addRelationshipsFromMetadata(dtos, options) {
         toTableId: to.id,
         missingSinceRefresh: false
       });
+
+      // The environment's view of which end is which can be the other way round from the diagram's,
+      // and this is where the diagram is brought into line with it. A route shaped by hand around
+      // the old ends is drawn back over itself once they swap.
+      if (existing.fromTableId !== before.fromTableId || existing.toTableId !== before.toTableId) {
+        clearManualRoute(existing);
+      }
+
       continue;
     }
 
@@ -621,6 +631,32 @@ export function reconcileProposedLookups() {
       }
     }
   }
+}
+
+/**
+ * Takes the routing off a connector whose two ends are about to change, or whose cards are about
+ * to be moved wholesale.
+ *
+ * Hand-placed corners are absolute canvas coordinates, unlike the two offsets, which are measured
+ * from the automatic route and are clamped between the cards - so an offset degrades into
+ * something harmless when the diagram is rearranged and a corner does not. Swap the ends of a
+ * hand-routed relationship and the route visits its corners in the reverse order, drawing back
+ * over itself; rearrange the canvas and the line detours to where a card used to be.
+ *
+ * Both offsets go with them. What is left is the connector the canvas would draw, which is the
+ * only honest answer once the thing the corners were placed around has gone.
+ */
+export function clearManualRoute(relationship) {
+  if (!relationship) return false;
+
+  const had = (Array.isArray(relationship.waypoints) && relationship.waypoints.length) ||
+    relationship.routeOffset || relationship.routeOffsetCross;
+
+  relationship.waypoints = [];
+  relationship.routeOffset = 0;
+  relationship.routeOffsetCross = 0;
+
+  return !!had;
 }
 
 /**

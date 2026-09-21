@@ -148,7 +148,7 @@ function build(dialog, model) {
  * Says what will be lost, based on what is actually on this diagram rather than a generic list.
  * The specification asks for this before or during export, not after.
  */
-function collectWarnings(format) {
+export function collectWarnings(format) {
   const warnings = [];
   const doc = state.doc;
 
@@ -183,10 +183,21 @@ function collectWarnings(format) {
       (table.columns || []).filter(c => c.notes).length,
     0);
   const hasManyToMany = doc.relationships.some(r => r.included !== false && !r.hidden && r.kind === 'ManyToMany');
+
+  // Connectors the user has routed by hand - corners placed one at a time, or the line dragged
+  // clear of another. Worth a line of its own: it is the most time-consuming thing anyone does to
+  // a diagram, and the three formats that lay themselves out throw all of it away.
+  const routed = doc.relationships.filter(r =>
+    r.included !== false && !r.hidden &&
+    ((Array.isArray(r.waypoints) && r.waypoints.length) || r.routeOffset || r.routeOffsetCross)).length;
+
+  const routedText = target => routed + ' hand-routed ' + (routed === 1 ? 'connector' : 'connectors') +
+    '. ' + target;
   const hasCascade = doc.relationships.some(r => r.cascade);
 
   if (format === 'Mermaid') {
     warnings.push('Manual layout - the target tool will lay the diagram out itself.');
+    if (routed) warnings.push(routedText('Mermaid draws its own lines.'));
     if (hasHighlights) warnings.push('Highlight colours on ' + countHighlights() + ' objects.');
     if (doc.annotations.length) {
       warnings.push(doc.annotations.length + ' ' +
@@ -229,10 +240,16 @@ function collectWarnings(format) {
     }
 
     if (hasManyToMany) warnings.push('N:N intersect tables are named in the edge label only.');
+
+    if (routed) {
+      warnings.push(routedText('draw.io routes its own edges, so the corners you placed and the ' +
+        'lines you dragged clear are redrawn. Card positions are kept.'));
+    }
   }
 
   if (format === 'Visio') {
     warnings.push('Columns become text inside one shape rather than separately selectable rows.');
+    if (routed) warnings.push(routedText('Visio draws its own connectors. Card positions are kept.'));
     if (hasHighlights) warnings.push('Highlight colours.');
     if (doc.settings.showLegend) warnings.push('The legend panel.');
     if (hasNotes) warnings.push('Note leader lines. Sticky notes and text boxes themselves are exported.');

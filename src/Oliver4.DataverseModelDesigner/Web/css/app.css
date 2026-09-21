@@ -394,6 +394,13 @@ select option { background: var(--surface-raised); color: var(--ink); }
 
 .status-mark { width: 7px; height: 7px; border-radius: 2px; flex: none; }
 .st-existing { background: var(--accent); }
+
+/* An emphasis colour is a light-theme hex chosen for a card, and it is painted on this mark raw so
+   that the list, the cards and the legend agree. Several of them sit under 3:1 against the dark
+   panel - a 7px square nobody can find is not a colour key - so in dark mode the mark keeps an
+   outline of its own and the colour identifies it rather than having to carry it.
+   No state style to lose here: this element has no hover, focus or active rule anywhere. */
+body.theme-dark .status-mark.is-emphasis { box-shadow: 0 0 0 1px var(--line-strong); }
 .st-proposed { background: var(--proposed); }
 .st-external { background: var(--external); }
 .st-deprecated { background: var(--deprecated); }

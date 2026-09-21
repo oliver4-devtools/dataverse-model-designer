@@ -103,7 +103,8 @@ export function openDisplaySettings() {
         toast('Positions are yours to set. Nothing will be moved automatically.', 'info');
       } else {
         fitToView();
-        toast('Canvas rearranged. Undo (Ctrl+Z) restores the previous positions.', 'success');
+        toast('Canvas rearranged. Connectors go back to their automatic routes. ' +
+          'Undo (Ctrl+Z) restores both.', 'success');
       }
     }), 'Applies immediately and becomes the style used by the Auto-layout button.'));
 
@@ -504,7 +505,8 @@ export function openLayoutMenu(anchor) {
     padded: true,
     body: api => el('div', {}, [
       el('div', { class: 'small muted', style: { marginBottom: '12px', lineHeight: '1.5' } },
-        'Auto-layout replaces every manual position on the canvas. Undo restores them.'),
+        'Auto-layout replaces every manual position on the canvas, and puts every connector ' +
+        'back on its automatic route. Undo restores both.'),
       ...modes.map(([mode, label, detail]) => el('button', {
         class: 'choice-card',
         onClick: () => {
@@ -515,7 +517,8 @@ export function openLayoutMenu(anchor) {
           render();
           fitToView();
           api.close(null);
-          toast('Layout applied. Undo (Ctrl+Z) restores the previous positions.', 'success');
+          toast('Layout applied. Connectors go back to their automatic routes. ' +
+            'Undo (Ctrl+Z) restores both.', 'success');
         }
       }, [
         el('div', { class: 'choice-title', text: label }),
@@ -599,7 +602,11 @@ const FEATURES = [
     lines: [
       ['This tool only ever reads', 'Nothing it does changes the connected environment. Removing an object from a diagram, marking it deprecated, designing a proposed table - all of it lives in the diagram file alone.'],
       ['Right-click everything', 'The canvas, a table card, a connector, a sticky note and the legend each have their own menu, and most commands are quicker to reach there than from the toolbar. The legend can also be dragged anywhere on the canvas.'],
-      ['Keyboard', 'Ctrl+S save, Ctrl+O open, Ctrl+E export, Ctrl+Z and Ctrl+Y undo and redo, Ctrl+F search, Ctrl+0 reset zoom, Delete to remove the selection from the diagram.']
+      ['Untangling a diagram', 'A connector can be dragged out of the way in both directions at once, and its two ends stay on the columns they point at. Selecting a card puts a grip beside each of its rows - on a card showing more than one - and dragging one moves that column up or down the card, taking the connectors anchored to it with it. Between them, two lines that insist on crossing can usually be persuaded not to. A card\'s right-click menu puts its columns back in the ordinary order.'],
+      ['Moving one corner of a line', 'Select a connector and every right angle on it gains a handle. Drag one and the two legs that meet there move with it - nothing else does, and the line never gains a bend it did not have. A leg that ends on a card cannot move, because that end is sitting on the column the relationship points at, so a corner next to a card slides one way only and its cursor says which. Ctrl while dragging is fine adjustment. Right-click a corner for "Remove this bend", or hold Shift while dragging it, and the bend goes - offered only where the line can actually do without it. Dragging the line itself moves the leg you grabbed, the same way - the legs either side stretch to follow. A leg that ends on a card has nothing behind it to stretch, so the route is broken beside the card and the new corner carries that end: that is the one gesture here that adds a bend, and it is the gesture you are asking for one. "Straighten this connector" is the way back to the automatic route, and an auto-layout does the same to every connector at once.'],
+      ['Naming a colour', 'An emphasis colour applied to a card or a connector is listed in the legend. Click that row to give the colour a name - "Phase 2", "Out of scope" - and the name is what the legend, the exports and the inspector call it from then on. The model list beside the canvas paints its mark in the same colour.'],
+      ['Keyboard', 'Ctrl+S save, Ctrl+O open, Ctrl+E export, Ctrl+Z and Ctrl+Y undo and redo, Ctrl+F search, Ctrl+0 reset zoom, Delete to remove the selection from the diagram.'],
+      ['Modifiers while dragging', 'Shift adds to or removes from the selection, keeps an arrow straight, turns a sticky note in 15 degree steps, and releases a connector corner. Ctrl is fine adjustment - a card, an arrow or a corner moves a unit at a time instead of snapping. Space or Alt with a drag pans the canvas, as does the right button.']
     ]
   }
 ];

@@ -24,6 +24,20 @@ export const ANNOTATION_HANDLE = 12;
 /** How far above the top edge of a sticky note its rotation knob stands, in world units. */
 export const ROTATE_GRIP_OFFSET = 20;
 
+/** Width of the grip that reorders a row, drawn just outside the left edge of a selected card. */
+const ROW_GRIP_WIDTH = 10;
+
+/** Side of the mark drawn on a corner of a selected connector, in screen pixels. */
+const CORNER_HANDLE = 8;
+
+/**
+ * Side of the transparent square that catches the pointer on one, in screen pixels.
+ *
+ * Big enough to hit at any zoom, small enough not to make dead spots: the handles sit in the
+ * overlay, above the cards, so each one takes the press from whatever is underneath it.
+ */
+const CORNER_TARGET = 16;
+
 /** Lines of a table note shown on the canvas before it is cut short and left to the inspector. */
 const NOTE_MAX_LINES = 10;
 
@@ -159,6 +173,12 @@ function renderLinks() {
     group.forEach((relationship, index) => {
       const route = routeRelationship(relationship, index, group.length);
       if (!route) return;
+
+      // Where this connector sat in its fan of parallel lines. Anything that has to re-derive the
+      // same route later - the check that says whether a bend can be taken out - needs the same
+      // two numbers, or it is asking about a line drawn somewhere slightly else.
+      route.fanIndex = index;
+      route.fanCount = group.length;
 
       routeCache.set(relationship.id, route);
 
@@ -589,6 +609,8 @@ function renderTableCard(table, emphasis) {
     appendRow(group, row, y, rect);
   });
 
+  appendRowGrips(group, table, rect, selected);
+
   if (table.collapsed && (table.columns || []).length) {
     group.appendChild(svg('text', {
       x: rect.width / 2, y: rect.height + 12, 'text-anchor': 'middle',
@@ -707,6 +729,67 @@ function appendRow(group, row, y, rect) {
       text: row.type
     }));
   }
+}
+
+/**
+ * The handles that reorder the fields on a card, one per drawn row, down the outside of its left
+ * edge - and only while the card is selected.
+ *
+ * Outside the card rather than in the marker gutter, and behind a selection, because the whole face
+ * of a card is already a drag target that moves the card. A row that started a different drag
+ * depending on where in it the pointer went down would make moving a card a gamble, and the field
+ * order is not something anyone needs to change by accident.
+ *
+ * Nothing here is drawn into an export: buildExportSvgInner empties the selection first, which is
+ * the same thing that takes away the selection outline and the note tag's open state.
+ */
+function appendRowGrips(group, table, rect, selected) {
+  if (!selected || rect.rows.length < 2) return;
+
+  const theme = palette();
+
+  rect.rows.forEach((row, index) => {
+    const y = METRICS.headerHeight + index * METRICS.rowHeight;
+    const top = y + 2;
+    const height = METRICS.rowHeight - 4;
+
+    group.appendChild(svg('rect', {
+      x: -ROW_GRIP_WIDTH - 2, y: top, width: ROW_GRIP_WIDTH, height, rx: 2.5,
+      fill: theme.selection, 'fill-opacity': 0.14,
+      stroke: theme.selection, 'stroke-opacity': 0.4, 'stroke-width': 1,
+      'pointer-events': 'none'
+    }));
+
+    // Centred in the grip. The rect runs from -(width + 2) to -2, so its centre line is at
+    // -(width / 2 + 2) and a 6-unit mark starts 3 units before that, at -(width / 2 + 5) - which is
+    // -10 at the width this is drawn at. Two earlier attempts at this arithmetic put the marks hard
+    // against the right-hand edge, where they read as a rendering fault rather than a style.
+    const midY = y + METRICS.rowHeight / 2;
+    const markX = round(-(ROW_GRIP_WIDTH / 2 + 5));
+    group.appendChild(svg('path', {
+      d: 'M ' + markX + ' ' + round(midY - 2) + ' h 6 M ' +
+         markX + ' ' + round(midY + 2) + ' h 6',
+      fill: 'none',
+      stroke: theme.selection, 'stroke-width': 1, opacity: 0.85, 'pointer-events': 'none'
+    }));
+
+    // A separate, larger target. The mark is drawn small so it does not read as part of the
+    // drawing, and 10 units is a hard thing to hit with a mouse at 60% zoom.
+    //
+    // It stops one unit short of the card. Reaching the card's own edge meant that pressing on the
+    // left-hand border of a selected card at the height of a row started a reorder rather than
+    // moving the card, which is the gesture anyone would expect from the border of a card.
+    const target = svg('rect', {
+      x: -ROW_GRIP_WIDTH - 6, y, width: ROW_GRIP_WIDTH + 5, height: METRICS.rowHeight,
+      fill: 'transparent',
+      'data-row-grip': 'column',
+      'data-id': row.column.id,
+      'data-table': table.id,
+      style: 'cursor: grab'
+    });
+    target.appendChild(svg('title', { text: 'Drag to move this column up or down the card' }));
+    group.appendChild(target);
+  });
 }
 
 function headerPath(width, height, radius) {
@@ -1139,6 +1222,93 @@ function renderOverlay() {
 
   const noteCard = openNoteCard();
   if (noteCard) layers.overlay.appendChild(noteCard);
+
+  appendCornerHandles();
+}
+
+/**
+ * The handles on the corners of every selected connector, one per turn in its drawn route.
+ *
+ * Gated on the selection like the row grips and the note's resize corner, and for the same reason:
+ * the whole length of a connector is already a drag target that moves the route, and a gesture
+ * that meant one thing or the other depending on where along the line the pointer went down would
+ * make dragging a connector a gamble.
+ *
+ * Drawn in the overlay layer rather than inside the connector's own group, which is where they
+ * started. Three things stood over them there: a table card, since the cards are painted above the
+ * links and a corner dragged onto one could then neither be seen nor grabbed; an annotation drawn
+ * in front, which is where a note about a relationship goes by default; and the twelve-unit
+ * invisible stroke every *other* connector carries to be clickable - so the handles stopped
+ * working exactly where two lines cross, which is the one place this feature exists for. The
+ * overlay is above all three and is not drawn into an export at all.
+ *
+ * Sized in screen pixels rather than world units. Untangling a diagram is the one canvas task done
+ * zoomed *out*: at the 35% a twenty-table model fits at, a seven-unit mark is under three pixels
+ * across and its target is smaller than the pointer. The connector's own hit tolerance has been
+ * screen-constant since it was written, for the same reason.
+ *
+ * A corner the user placed is drawn filled with a pale outline, one the router worked out is drawn
+ * hollow, so the line says which parts of itself are being held where they are. The outline
+ * matters: the fill and the selected connector underneath it are the same colour, so without it a
+ * placed corner read as a slight thickening of the line rather than as something to take hold of.
+ */
+function appendCornerHandles() {
+  if (!state.selection.relationships.size) return;
+
+  const theme = palette();
+  const emphasis = dimming();
+  const scale = state.view.zoom > 0 ? state.view.zoom : 1;
+  const mark = CORNER_HANDLE / scale;
+  const target = CORNER_TARGET / scale;
+
+  for (const id of state.selection.relationships) {
+    const route = routeCache.get(id);
+    if (!route) continue;
+
+    // A path highlight dims everything that is not on the path, connectors included. Drawn inside
+    // the connector's own group these inherited that; in the overlay they do not, so a line faded
+    // back to 45% kept full-strength handles standing on it.
+    if (emphasis && !emphasis.links.has(id)) continue;
+
+    (route.corners || []).forEach((corner, index) => {
+      // A corner with a card at both ends of it has nothing that can move: both of its legs are
+      // held on the columns the relationship points at. A handle there would be a control that
+      // does nothing, so there is not one.
+      if (!corner.carryX && !corner.carryY) return;
+
+      const pinned = corner.waypointIndex !== null && corner.waypointIndex !== undefined;
+
+      layers.overlay.appendChild(svg('rect', {
+        x: round(corner.x - mark / 2), y: round(corner.y - mark / 2),
+        width: round(mark), height: round(mark), rx: round(1.5 / scale),
+        fill: pinned ? theme.selection : theme.canvas,
+        stroke: pinned ? theme.canvas : theme.selection,
+        'stroke-width': round(1.4 / scale),
+        'pointer-events': 'none'
+      }));
+
+      // The cursor says which way this one goes, because a corner beside a card goes one way only
+      // and a handle that ignores half of every drag needs to say so before the drag, not during
+      // it.
+      const cursor = corner.carryX && corner.carryY ? 'move'
+        : corner.carryX ? 'ew-resize' : 'ns-resize';
+
+      const hit = svg('rect', {
+        x: round(corner.x - target / 2), y: round(corner.y - target / 2),
+        width: round(target), height: round(target),
+        fill: 'transparent',
+        'data-corner': String(index),
+        'data-id': id,
+        style: 'cursor: ' + cursor
+      });
+      hit.appendChild(svg('title', {
+        text: cursor === 'move' ? 'Drag to move the two legs that meet here'
+          : cursor === 'ew-resize' ? 'Drag left and right to move this leg'
+          : 'Drag up and down to move this leg'
+      }));
+      layers.overlay.appendChild(hit);
+    });
+  }
 }
 
 /**
@@ -1504,13 +1674,18 @@ function buildTitleBlock(bounds) {
 function stripInteractionAttributes(root) {
   const nodes = root.querySelectorAll(
     '[data-kind],[data-id],[data-hit],[data-note-for],[data-note-close],[data-resize],' +
-    '[data-rotate],[data-arrow-start],[data-arrow-end],[pointer-events]');
+    '[data-rotate],[data-row-grip],[data-corner],[data-arrow-start],[data-arrow-end],[pointer-events]');
 
   for (const node of nodes) {
     // A control's tooltip describes what clicking it does, which is a lie in a static file. The
     // ownership pill's <title> is left alone deliberately - that one explains the drawing, and is
     // worth having when the SVG is opened in a browser.
-    if (node.hasAttribute && node.hasAttribute('data-note-for')) {
+    // A grip carries a tooltip describing a gesture, which is nonsense in a static file - and one
+    // is never drawn into an export anyway, because buildExportSvgInner empties the selection
+    // first. This is the belt to that pair of braces: the title is what would survive the rest of
+    // this pass, since a <title> is a child element rather than an attribute.
+    if (node.hasAttribute && (node.hasAttribute('data-note-for') ||
+        node.hasAttribute('data-row-grip') || node.hasAttribute('data-corner'))) {
       // Array.from because childNodes is a live NodeList in a real DOM and removing from it while
       // iterating skips entries.
       for (const child of Array.from(node.childNodes)) {
@@ -1525,6 +1700,8 @@ function stripInteractionAttributes(root) {
     node.removeAttribute('data-note-close');
     node.removeAttribute('data-resize');
     node.removeAttribute('data-rotate');
+    node.removeAttribute('data-row-grip');
+    node.removeAttribute('data-corner');
     node.removeAttribute('data-arrow-start');
     node.removeAttribute('data-arrow-end');
 
@@ -1534,7 +1711,12 @@ function stripInteractionAttributes(root) {
       node.removeAttribute('style');
     }
 
-    if (node.getAttribute('stroke') === 'transparent') node.remove();
+    // Every invisible node in this drawing is a hit target: the wide path under a connector, the
+    // rectangle that makes a text box clickable, the grip beside a row. They are drawn transparent
+    // rather than not drawn at all, and in a file opened in a browser they are parts of the picture
+    // that catch the mouse and do nothing.
+    if (node.getAttribute('stroke') === 'transparent' ||
+        node.getAttribute('fill') === 'transparent') node.remove();
     else node.removeAttribute('pointer-events');
   }
 }

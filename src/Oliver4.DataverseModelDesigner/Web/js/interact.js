@@ -9,7 +9,8 @@ import {
 import { render, routeFor, MIN_NOTE_WIDTH, MIN_NOTE_HEIGHT } from './render.js';
 import {
   measureTable, tableRect, distanceToPolyline, rectsIntersect, annotationRect, annotationBounds,
-  documentBounds, stickyTilt
+  documentBounds, stickyTilt, visibleColumns, cardOrderAfterMove, columnOrderKey, invalidateSizes,
+  cornersWithout, METRICS
 } from './geometry.js';
 
 const MIN_ZOOM = 0.15;
@@ -36,7 +37,10 @@ const drag = {
   button: 0,
   routeId: null,
   routeAxis: 'x',
-  resizeId: null
+  routeCrossAxis: null,
+  rowTableId: null,
+  resizeId: null,
+  pointerId: null
 };
 
 /** Set when a right-button drag panned the canvas, so the drag does not also open a menu. */
@@ -62,7 +66,11 @@ export function initInteractions(handlers) {
   canvas.addEventListener('pointerdown', onPointerDown);
   canvas.addEventListener('pointermove', onPointerMove);
   canvas.addEventListener('pointerup', onPointerUp);
-  canvas.addEventListener('pointercancel', onPointerUp);
+  // Not onPointerUp. A cancelled pointer is the gesture being taken away - the browser turning a
+  // touch drag into a pan, the view losing the input - not the user finishing it, and committing it
+  // wrote half a move into the diagram and pushed an undo entry for a gesture nobody completed.
+  // The legend has worked this way since 1.8.0; the canvas did not.
+  canvas.addEventListener('pointercancel', onPointerCancel);
   canvas.addEventListener('wheel', onWheel, { passive: false });
   canvas.addEventListener('contextmenu', onCanvasContextMenu);
   canvas.addEventListener('dblclick', onDoubleClick);
@@ -92,6 +100,15 @@ export function initInteractions(handlers) {
     // gesture committed against whatever had arrived: opening a file mid-drag pushed an undo entry
     // and marked the new diagram dirty before the user had touched it.
     forgetDrag();
+  });
+
+  // Undo and redo replace the document with a clone, which is the same swap under another name -
+  // and Ctrl+Z is a great deal easier to press mid-drag than Ctrl+O. Left alone, the release wrote
+  // the drag's captured origin onto an object from the *new* document and took its undo snapshot
+  // from that, so the top of the stack then restored a value from the branch of history the user
+  // had just undone past, and the redo they were entitled to had been cleared.
+  subscribe(reason => {
+    if (reason === 'undo' || reason === 'redo') forgetDrag();
   });
 
   // A dialog is about to cover the canvas, so any mode waiting for the next click on that canvas
@@ -185,9 +202,316 @@ function hitTest(event) {
   return null;
 }
 
+/** Whether this pointer is the one that started the gesture in flight. See drag.pointerId. */
+function ownsDrag(event) {
+  if (!event || event.pointerId === undefined || drag.pointerId === null) return true;
+  return event.pointerId === drag.pointerId;
+}
+
+/** A number a drag can safely start from. NaN and infinity both become zero. */
+function usable(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * A connector's hand-placed corners, copied and cleaned, ready for a drag to work on.
+ *
+ * Copied because every one of these drags writes live and is put back by the commit in onPointerUp
+ * or by abandonDrag, and handing either of those the array the document is holding would give it
+ * nothing to put back. Cleaned by the same rule the router applies: a point that is not a pair of
+ * finite numbers is not drawn, so it is not dragged either.
+ */
+function pinnedCopy(relationship) {
+  const raw = Array.isArray(relationship.waypoints) ? relationship.waypoints : [];
+  const points = [];
+
+  for (const point of raw) {
+    if (!point) continue;
+    const x = Number(point.x);
+    const y = Number(point.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    points.push({ x, y });
+  }
+
+  return points;
+}
+
+/** A fresh array of fresh points, for the same reason pinnedCopy copies. */
+function clonePoints(points) {
+  return (points || []).map(point => ({ x: point.x, y: point.y }));
+}
+
+/** Whether two sets of hand-placed corners are the same set. */
+function samePinning(a, b) {
+  if (a.length !== b.length) return false;
+  return a.every((point, at) =>
+    Math.abs(point.x - b[at].x) < 0.01 && Math.abs(point.y - b[at].y) < 0.01);
+}
+
+/**
+ * What a drag on one corner of a connector has to know.
+ *
+ * The corners of the route *as it is drawn* - not the list the relationship is carrying, which may
+ * be shorter, because the router turns whatever extra bends it needs to reach the placed ones once
+ * the cards have moved. Baking the drawn line is what makes a drag a move rather than an addition:
+ * the corners either side of the one being grabbed are in the list too, so moving a leg moves both
+ * of its ends and the line gains nothing.
+ */
+function cornerDragOrigin(relationship, route, cornerIndex) {
+  const corners = route.corners || [];
+  const corner = corners[cornerIndex];
+  if (!corner) return null;
+  if (!corner.carryX && !corner.carryY) return null;
+
+  return {
+    previous: pinnedCopy(relationship),
+    base: corners.map(entry => ({ x: entry.x, y: entry.y })),
+    index: cornerIndex,
+    carryX: corner.carryX,
+    carryY: corner.carryY,
+    start: { x: route.start.x, y: route.start.y },
+    end: { x: route.end.x, y: route.end.y },
+
+    // What Shift, and the connector's own right-click menu, do instead of moving it: take the bend
+    // out. Null when the route cannot be drawn without a turn there, and then both say so by
+    // doing nothing rather than by putting it straight back.
+    removal: cornersWithout(relationship, route.fanIndex, route.fanCount, cornerIndex),
+
+    offset: usable(relationship.routeOffset),
+    cross: usable(relationship.routeOffsetCross)
+  };
+}
+
+/**
+ * The corners after one of them has been dragged: the two legs that meet at it move, and nothing
+ * else does.
+ *
+ * Each axis is taken separately, because the two legs are. Moving along x carries the vertical leg
+ * and leaves the horizontal one to stretch; moving along y does the opposite. A leg held at an
+ * anchor does not move, and `carryX`/`carryY` are null for that axis - which is why a corner next
+ * to a card slides one way only.
+ */
+function dragCornerTo(origin, worldDx, worldDy, snap) {
+  const points = clonePoints(origin.base);
+  const here = origin.base[origin.index];
+
+  const move = (axis, carry, to) => {
+    if (!carry) return;
+
+    const moving = [origin.index].concat(carry).filter(at => points[at]);
+    const target = clampLeg(origin, moving, axis, Math.round(to / snap) * snap);
+
+    for (const at of moving) points[at][axis] = target;
+  };
+
+  move('x', origin.carryX, here.x + worldDx);
+  move('y', origin.carryY, here.y + worldDy);
+
+  return points;
+}
+
+/** The shortest a leg is allowed to get before it stops being a leg, in canvas units. */
+const MIN_LEG = 12;
+
+/** How far from a card a leg that has to be broken to move puts its new corner, in canvas units. */
+const LEG_STEP = 20;
+
+/**
+ * Which leg of a drawn route a press landed on: the index of the point the leg starts at, or null
+ * when the route has nothing to grab.
+ */
+function nearestLeg(points, world) {
+  let best = null;
+  let closest = Infinity;
+
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i];
+    const b = points[i + 1];
+
+    const run = Math.abs(a.x - b.x) > Math.abs(a.y - b.y) ? 'x' : 'y';
+    const across = run === 'x' ? 'y' : 'x';
+    if (Math.abs(a[run] - b[run]) < 0.01) continue;
+
+    const low = Math.min(a[run], b[run]);
+    const high = Math.max(a[run], b[run]);
+    const on = Math.max(low, Math.min(high, world[run]));
+
+    const distance = Math.hypot(on - world[run], a[across] - world[across]);
+    if (distance < closest) { closest = distance; best = i; }
+  }
+
+  return best;
+}
+
+/**
+ * The corners after the leg the drag grabbed has been moved across itself.
+ *
+ * The two legs either side run the other way, so they simply stretch - which is the whole of it
+ * when both ends of the moved leg are corners. When an end is an *anchor* there is no leg there to
+ * stretch: the anchor is sitting on the column the relationship points at and cannot travel, so the
+ * route is broken just clear of the card and the new corner carries that end instead. That is the
+ * one gesture on this canvas that adds a bend, and it is the gesture the bend is being asked for.
+ *
+ * Returns null when the leg cannot move - a straight run with a card at both ends of it.
+ */
+function dragLegTo(origin, worldDx, worldDy, snap) {
+  const points = origin.points;
+  const at = origin.leg;
+  if (at === null || at < 0 || at + 1 >= points.length) return null;
+
+  const a = points[at];
+  const b = points[at + 1];
+
+  // The leg runs one way and moves the other.
+  const across = Math.abs(a.x - b.x) < 0.01 ? 'x' : 'y';
+  const run = across === 'x' ? 'y' : 'x';
+  const to = Math.round((a[across] + (across === 'x' ? worldDx : worldDy)) / snap) * snap;
+
+  // The drag has travelled, but not far enough to move the leg anywhere. Breaking the route to put
+  // it back where it already is would be an undo step that undid nothing and a connector carrying
+  // corners nobody placed.
+  if (Math.abs(to - a[across]) < 0.01) return null;
+
+  const ahead = [];
+  const behind = [];
+
+  // An end that is one of the two anchors is broken rather than moved. The new corner stands clear
+  // of the card by a step, or a third of the leg when the leg is shorter than that - the picture is
+  // a step at the end of a run, and a step longer than the run it is on is not one.
+  const step = Math.max(2, Math.min(LEG_STEP, Math.abs(b[run] - a[run]) / 3));
+
+  let first;
+  let second;
+
+  if (at === 0) {
+    const q = a[run] + (b[run] > a[run] ? step : -step);
+    ahead.push({ x: a.x, y: a.y }, across === 'x' ? { x: a.x, y: q } : { x: q, y: a.y });
+    first = across === 'x' ? { x: to, y: q } : { x: q, y: to };
+  } else {
+    for (let i = 0; i < at; i++) ahead.push({ x: points[i].x, y: points[i].y });
+    first = across === 'x' ? { x: to, y: a.y } : { x: a.x, y: to };
+  }
+
+  if (at + 1 === points.length - 1) {
+    const q = b[run] + (a[run] > b[run] ? step : -step);
+    second = across === 'x' ? { x: to, y: q } : { x: q, y: to };
+    behind.push(across === 'x' ? { x: b.x, y: q } : { x: q, y: b.y }, { x: b.x, y: b.y });
+  } else {
+    second = across === 'x' ? { x: to, y: b.y } : { x: b.x, y: to };
+    for (let i = at + 2; i < points.length; i++) behind.push({ x: points[i].x, y: points[i].y });
+  }
+
+  // Interior points only: the two anchors belong to the cards, not to the list.
+  return ahead.concat([first, second], behind).slice(1, -1);
+}
+
+/**
+ * Keeps a leg being dragged clear of the card at the far end of the leg it is stretching.
+ *
+ * The leg that stretches is the one running the other way, and at one or both ends of the route
+ * that leg finishes on an anchor. Dragged all the way onto the anchor's own coordinate it has no
+ * length left, tidy drops it, and the two corners either side of it collapse into one with a card
+ * at both ends - which can move neither leg, so it is given no handle and the connector the user
+ * was in the middle of shaping loses every control it had.
+ */
+function clampLeg(origin, moving, axis, target) {
+  let low = -Infinity;
+  let high = Infinity;
+
+  for (const at of moving) {
+    for (const side of [{ point: at === 0 ? origin.start : null, from: -1 },
+                        { point: at === origin.base.length - 1 ? origin.end : null, from: 1 }]) {
+      if (!side.point) continue;
+
+      // Only a leg lying *along* this axis is the one being stretched; one across it is the leg
+      // being moved, and its far end is travelling too.
+      const other = axis === 'x' ? 'y' : 'x';
+      if (Math.abs(side.point[other] - origin.base[at][other]) >= 0.01) continue;
+
+      const room = origin.base[at][axis] - side.point[axis];
+      if (room > 0.01) low = Math.max(low, side.point[axis] + MIN_LEG);
+      else if (room < -0.01) high = Math.min(high, side.point[axis] - MIN_LEG);
+    }
+  }
+
+  return Math.max(low, Math.min(high, target));
+}
+
+/**
+ * Writes the corners a drag has arrived at onto the connector.
+ *
+ * Both offsets go with them. The corners a drag pins are read off the *drawn* route, which already
+ * has both offsets in it, so leaving them set would apply them to the manual route a second time;
+ * and a Shift that puts the route back to automatic has to put the offsets back with it, or the
+ * connector would snap to a shape it has never had.
+ */
+function applyCorners(relationship, points, offset, cross) {
+  relationship.waypoints = clonePoints(points);
+  relationship.routeOffset = offset;
+  relationship.routeOffsetCross = cross;
+}
+
+/** A pointer taken away mid-gesture. Puts back whatever the drag had written and ends it. */
+function onPointerCancel(event) {
+  if (event && event.pointerId !== undefined) {
+    try { canvas.releasePointerCapture(event.pointerId); } catch (error) { /* pointer already gone */ }
+  }
+
+  if (!drag.mode) return;
+
+  abandonDrag();
+  render();
+}
+
+/**
+ * Puts the row being dragged wherever the pointer now is, live on the card.
+ *
+ * Live rather than on release because the card is the only feedback there is: the rows are drawn
+ * where the order says they go, so watching them move *is* watching the drag. The original order is
+ * held on the drag and put back by abandonDrag, and the commit in onPointerUp is the same
+ * revert-then-mutate the connector drag uses, so the whole gesture is one undo step.
+ */
+function dragRowTo(event) {
+  const table = tableById(drag.rowTableId);
+  if (!table) return;
+
+  const rows = visibleColumns(table);
+  if (rows.length < 2) return;
+
+  const from = rows.findIndex(column => column.id === drag.origin.columnId);
+  if (from < 0) return;
+
+  const rect = tableRect(table);
+  const world = toWorld(event.clientX, event.clientY);
+  const over = Math.floor((world.y - rect.y - METRICS.headerHeight) / METRICS.rowHeight);
+  const to = Math.max(0, Math.min(rows.length - 1, over));
+
+  if (to === from) return;
+
+  const keys = rows.map(columnOrderKey);
+  const moved = keys.splice(from, 1)[0];
+  keys.splice(to, 0, moved);
+
+  // No invalidateSizes. The card's order is part of what measureTable keys its cache on, so the
+  // rows are re-measured because they are a different question, not because the cache was emptied -
+  // and emptying it here would re-measure every card on the diagram each time the pointer crossed
+  // a row boundary.
+  table.columnOrder = cardOrderAfterMove(table, keys);
+  render();
+}
+
 // --------------------------------------------------------------- pointer --
 
 function onPointerDown(event) {
+  // A gesture already in flight, and a second button or a second finger going down on top of it.
+  // Everything below overwrites the drag state, and the commit in onPointerUp is keyed on the mode
+  // it finds there - so the first drag simply never reached its own commit, while the geometry it
+  // had already written live stayed on the object with no undo entry and the diagram not even
+  // marked unsaved. Press the right button mid-drag to pan and the connector stayed where it had
+  // been dragged to, permanently and silently.
+  if (drag.mode) { abandonDrag(); render(); }
+
   canvas.setPointerCapture(event.pointerId);
 
   // Cleared where the gesture that sets it begins, not where it is consumed. It is set on the way
@@ -201,6 +525,12 @@ function onPointerDown(event) {
   drag.startWorld = toWorld(event.clientX, event.clientY);
   drag.moved = false;
   drag.button = event.button;
+
+  // Which pointer owns what follows. A second finger - or a stylus alongside a mouse - starts its
+  // own gesture above, and the first one's release would otherwise arrive here as the end of that
+  // gesture: it nulled the mode and released the capture for the wrong pointer, and the drag still
+  // under the second finger died in silence. The legend drag has been guarded this way since 1.8.0.
+  drag.pointerId = event.pointerId === undefined ? null : event.pointerId;
 
   // A draw tool is armed, so the next click on the canvas means "put one here" rather than
   // "select whatever is under the pointer". Checked before everything else for the same reason
@@ -359,6 +689,62 @@ function onPointerDown(event) {
     }
   }
 
+  // The handles on the corners of a selected connector. Checked before the hit test for the same
+  // reason as the arrow handles: the hit test finds the connector underneath and starts a drag of
+  // the whole route, which is the gesture this one exists to be an alternative to. Not while
+  // connecting, for the reason above.
+  //
+  // Shift is read on the way down as well as during the move, which it is not for anything the hit
+  // test finds: a handle is its own target, so Shift here cannot be the toggle-the-selection
+  // modifier that a Shift-press on the line itself is. A Shift or Ctrl press that turns out to be a
+  // *click* is still a selection gesture though, and the release deals with that - without it,
+  // Shift-clicking a connector to take it out of a selection silently did nothing whenever the
+  // click happened to land on one of its bends.
+  if (event.button === 0 && !isConnecting()) {
+    const handle = event.target.closest ? event.target.closest('[data-corner]') : null;
+
+    if (handle) {
+      const relationship = relationshipById(handle.getAttribute('data-id'));
+      const route = relationship ? routeFor(relationship.id) : null;
+      const origin = route ? cornerDragOrigin(relationship, route, Number(handle.getAttribute('data-corner'))) : null;
+
+      if (origin) {
+        drag.mode = 'corner';
+        drag.routeId = relationship.id;
+        drag.origin = origin;
+        return;
+      }
+    }
+  }
+
+  // The grips down the outside of a selected card's left edge, which put its rows in a different
+  // order. Checked with the other controls drawn on a selection rather than after the hit test:
+  // they stand outside the card, so the hit test would find nothing there and start a marquee
+  // across the canvas instead. Not while connecting, for the reason above.
+  if (event.button === 0 && !isConnecting()) {
+    const grip = event.target.closest ? event.target.closest('[data-row-grip]') : null;
+
+    if (grip) {
+      const table = tableById(grip.getAttribute('data-table'));
+      const columnId = grip.getAttribute('data-id');
+
+      // The grip was drawn for a row the card was showing at the time. Anything that repaints the
+      // card between the draw and the press can take that row away, and reordering against a row
+      // that is no longer there would write an order describing a card nobody can see.
+      if (table && visibleColumns(table).some(column => column.id === columnId)) {
+        drag.mode = 'row';
+        drag.rowTableId = table.id;
+        drag.origin = {
+          columnId,
+          // Empty rather than null for a card that had no order: both mean the same thing to every
+          // reader, and null is the one of the two that ends up written into the saved file.
+          order: Array.isArray(table.columnOrder) ? table.columnOrder.slice() : []
+        };
+        return;
+      }
+    }
+  }
+
   // Right-button drag pans the canvas. A right-click that does not move still opens the menu,
   // which is why the menu is only suppressed once the pointer has actually travelled.
   if (event.button === 2) {
@@ -441,7 +827,28 @@ function onPointerDown(event) {
     drag.mode = 'route';
     drag.routeId = hit.id;
     drag.routeAxis = route.offsetAxis === 'y' ? 'y' : 'x';
-    drag.origin = { offset: Number(relationship.routeOffset) || 0 };
+
+    // The other axis, when this shape has one. A connector running down the outside of two stacked
+    // cards does not: its two arms are at the rows they point at, and the lane is the only part of
+    // it that can move. Left null, the drag writes nothing across rather than a number that draws
+    // nothing and then has to be explained.
+    drag.routeCrossAxis = route.crossAxis === 'x' || route.crossAxis === 'y' ? route.crossAxis : null;
+
+    // The same guard routeRelationship applies. `Number(x) || 0` turns NaN into zero and leaves
+    // infinity alone, and an infinite origin means every move writes infinity back: the connector
+    // draws at zero - the router guards it - and can never be dragged to a value that is not
+    // infinite. The host clears both on the way in from a file; a document pushed over the bridge
+    // does not pass through that.
+    drag.origin = {
+      offset: usable(relationship.routeOffset),
+      cross: usable(relationship.routeOffsetCross),
+
+      // A route the user has already shaped by hand has no offset to move - the shape is the
+      // corners - so what a drag on it moves is the leg it was grabbed by.
+      waypoints: pinnedCopy(relationship),
+      points: route.points.map(point => ({ x: point.x, y: point.y })),
+      leg: nearestLeg(route.points, drag.startWorld)
+    };
     return;
   }
 
@@ -461,7 +868,12 @@ function forgetDrag() {
   drag.moved = false;
   drag.origin = null;
   drag.routeId = null;
+  drag.rowTableId = null;
   drag.resizeId = null;
+
+  // The arrow that was being dragged out belongs to the gesture, not to the document: nothing has
+  // been committed, and renderOverlay goes on painting it until it is taken away.
+  state.pendingArrow = null;
 
   clearDragChrome('marquee');
 }
@@ -494,10 +906,52 @@ function abandonDrag() {
 
   if (!mode || !drag.moved) { drag.resizeId = null; return; }
 
-  if (mode === 'route') {
+  // The one gesture this keeps rather than puts back.
+  //
+  // A pan is navigation, not an edit: nothing in the diagram changed, and snapping the canvas back
+  // to where the user was looking a moment ago is a worse answer than leaving them where they can
+  // see. But the *document* only learns where the view is in onPointerUp, which an abandoned
+  // gesture never reaches - so the canvas sat panned on screen while the diagram still held the old
+  // position, and the view that got saved was one nobody was looking at.
+  if (mode === 'pan') {
+    state.doc.view = { zoom: state.view.zoom, panX: state.view.panX, panY: state.view.panY };
+    return;
+  }
+
+  // An arrow being dragged out is a draw mode as well as a drag. endDrawMode puts both away - the
+  // pending arrow renderOverlay is painting, the armed tool and its banner.
+  if (mode === 'draw-arrow') {
+    endDrawMode();
+    return;
+  }
+
+  if (mode === 'route' || mode === 'corner') {
     const relationship = relationshipById(drag.routeId);
-    if (relationship) relationship.routeOffset = drag.origin.offset;
+    const was = mode === 'corner' ? drag.origin.previous : drag.origin.waypoints;
+
+    if (relationship) {
+      relationship.routeOffset = drag.origin.offset;
+      relationship.routeOffsetCross = drag.origin.cross;
+
+      // Only when there is something to put back, or something to take away. An ordinary offset
+      // drag on a connector with no corners should leave it without the property, not with an
+      // empty list the gesture had nothing to do with.
+      if (was.length || (relationship.waypoints || []).length) {
+        relationship.waypoints = clonePoints(was);
+      }
+    }
+
     drag.routeId = null;
+    return;
+  }
+
+  if (mode === 'row') {
+    const table = tableById(drag.rowTableId);
+    drag.rowTableId = null;
+    if (table) {
+      table.columnOrder = drag.origin.order;
+      render();
+    }
     return;
   }
 
@@ -627,6 +1081,7 @@ function captureMovablePositions() {
 
 function onPointerMove(event) {
   if (!drag.mode) return;
+  if (!ownsDrag(event)) return;
 
   const dx = event.clientX - drag.startScreen.x;
   const dy = event.clientY - drag.startScreen.y;
@@ -646,13 +1101,101 @@ function onPointerMove(event) {
     return;
   }
 
+  if (drag.mode === 'corner') {
+    const relationship = relationshipById(drag.routeId);
+    if (!relationship) return;
+
+    if (event.shiftKey) {
+      // Shift takes the bend out rather than moving it, which is the same thing the connector's
+      // right-click menu offers - and, like the menu, it does nothing at all on a corner the route
+      // cannot be drawn without.
+      //
+      // The corners left behind carry the whole shape, so the two offsets - which move the middle
+      // of an *automatic* route - have nothing left to move and would be applied a second time the
+      // moment anything cleared the corners. An empty list is the automatic route, and there they
+      // are exactly what the user last dragged, so there they stay.
+      const left = drag.origin.removal || drag.origin.previous;
+      applyCorners(relationship, left,
+        left.length ? 0 : drag.origin.offset,
+        left.length ? 0 : drag.origin.cross);
+    } else {
+      // Snapped like a card is, and to the same end: the *position* is rounded, not the distance
+      // travelled. Rounding the distance keeps whatever the corner's offset from the grid was when
+      // it was picked up, so two corners that started a unit and a half apart could be dragged all
+      // day and never line up - which on a feature whose whole purpose is tidying is the wrong way
+      // round. Ctrl turns it off for fine work, as it does everywhere else.
+      const snap = event.ctrlKey ? 1 : 4;
+
+      // Three screen pixels is enough to count as a drag anywhere on this canvas, and at anything
+      // above about 1.3x zoom that is less than half a snap. On a connector nobody has touched, the
+      // press pins the whole route, so a slip that small turned an automatic connector into a
+      // hand-routed one with nothing on screen to show for it: no visible change, an undo step that
+      // undid nothing, and a line that had quietly stopped following its cards. A connector that is
+      // already hand-routed has nothing to lose, so it moves from the first pixel.
+      if (!drag.origin.previous.length &&
+          Math.hypot(dx, dy) / state.view.zoom < snap / 2) {
+        applyCorners(relationship, drag.origin.previous, drag.origin.offset, drag.origin.cross);
+        render();
+        return;
+      }
+
+      const moved = dragCornerTo(drag.origin, dx / state.view.zoom, dy / state.view.zoom, snap);
+
+      // A corner that has not actually got anywhere - the drag is still inside one snap step, the
+      // only axis it can travel on has not moved, or the leg has been dragged up against the card
+      // it ends on - leaves the connector exactly as the press found it. Writing the baked corners
+      // anyway pinned a whole route to the shape it already had: nothing to see, an undo step that
+      // undid nothing, and a line that had quietly stopped following its cards.
+      if (samePinning(moved, drag.origin.base)) {
+        applyCorners(relationship, drag.origin.previous, drag.origin.offset, drag.origin.cross);
+      } else {
+        applyCorners(relationship, moved, 0, 0);
+      }
+    }
+
+    render();
+    return;
+  }
+
   if (drag.mode === 'route') {
     const relationship = relationshipById(drag.routeId);
     if (!relationship) return;
 
+    // A route the user has already shaped by hand has no automatic shape left for the two offsets
+    // to move the middle of, so a drag on it moves the leg it was grabbed by - the same thing a
+    // drag on a corner does, grabbed by the leg instead of the corner.
+    //
+    // It used to carry every corner at once. Both ends stay on their columns whatever the middle
+    // does, so the router then had to reconnect a shape that had moved away from them - and it did
+    // that differently at the two ends. At one the extra leg ran the same way as the leg already
+    // there and merged with it, which looked like the line stretching; at the other it overshot and
+    // came back, leaving a stub hanging off the route with a handle on the end of it. David: "it
+    // looks odd and you would never want it to look like that".
+    if (drag.origin.waypoints.length && drag.origin.leg !== null) {
+      const snap = event.ctrlKey ? 1 : 4;
+      const moved = dragLegTo(drag.origin, dx / state.view.zoom, dy / state.view.zoom, snap);
+
+      if (moved) applyCorners(relationship, moved, 0, 0);
+      else applyCorners(relationship, drag.origin.waypoints, drag.origin.offset, drag.origin.cross);
+
+      render();
+      return;
+    }
+
     const delta = (drag.routeAxis === 'y' ? dy : dx) / state.view.zoom;
     relationship.routeOffset = drag.origin.offset + delta;
+
+    if (drag.routeCrossAxis) {
+      const across = (drag.routeCrossAxis === 'y' ? dy : dx) / state.view.zoom;
+      relationship.routeOffsetCross = drag.origin.cross + across;
+    }
+
     render();
+    return;
+  }
+
+  if (drag.mode === 'row') {
+    dragRowTo(event);
     return;
   }
 
@@ -779,6 +1322,11 @@ function onPointerMove(event) {
 function onPointerUp(event) {
   if (!drag.mode) return;
 
+  // The release of a pointer that is not the one holding this gesture. Ending the gesture here
+  // nulled the mode and released the capture for the wrong pointer, and the drag the other one was
+  // still making went on moving things with nothing left to commit it.
+  if (!ownsDrag(event)) return;
+
   const mode = drag.mode;
   drag.mode = null;
   canvas.classList.remove('is-panning');
@@ -793,14 +1341,105 @@ function onPointerUp(event) {
 
   try { canvas.releasePointerCapture(event.pointerId); } catch (error) { /* pointer already gone */ }
 
+  if (mode === 'corner') {
+    const relationship = relationshipById(drag.routeId);
+    drag.routeId = null;
+
+    if (!relationship) return;
+
+    // Shift on a handle without a drag is the short way to release one corner. The gesture is over
+    // before the three-pixel threshold, so nothing has been written yet and the commit below is
+    // handed the snapped corners directly.
+    if (!drag.moved) {
+      // Measured against what the connector had before the drag, not against the corners the drag
+      // is working within: on an untouched connector those are the whole drawn route, so a bare
+      // Shift-click looked like it was dropping every one of them and wrote an undo entry that put
+      // back exactly what was already there.
+      const releasable = !!drag.origin.removal;
+
+      if (!event.shiftKey || !releasable) {
+        // A Shift click with nothing to release: the gesture the user is making is the ordinary one
+        // of adding this connector to a selection or taking it out again, which is what it would
+        // have been a few pixels further along the same line.
+        //
+        // Shift only. Ctrl is the fine-adjustment modifier for this very drag, and the guide says
+        // so - a user holding it to move a corner a unit at a time, who happens not to travel three
+        // pixels, would have had the connector taken out of the selection instead.
+        if (event.shiftKey) {
+          toggleSelection('relationships', relationship.id);
+          render();
+          onSelectionChange();
+        }
+        return;
+      }
+
+      applyCorners(relationship, drag.origin.removal,
+        drag.origin.removal.length ? 0 : drag.origin.offset,
+        drag.origin.removal.length ? 0 : drag.origin.cross);
+    }
+
+    const after = clonePoints(relationship.waypoints);
+    const afterOffset = relationship.routeOffset;
+    const afterCross = relationship.routeOffsetCross;
+
+    // Shift held through a drag on a connector that had no hand-placed corners in the first place
+    // leaves it exactly as it was - it was already drawing its automatic route. Committing that
+    // would put an undo step on the stack that undoes nothing, which is worse than no gesture at
+    // all: the next Ctrl+Z appears to do nothing.
+    if (samePinning(after, drag.origin.previous) &&
+        afterOffset === drag.origin.offset && afterCross === drag.origin.cross) return;
+
+    applyCorners(relationship, drag.origin.previous, drag.origin.offset, drag.origin.cross);
+    mutate('move connector corner', () => {
+      applyCorners(relationship, after, afterOffset, afterCross);
+    });
+    render();
+    return;
+  }
+
   if (mode === 'route') {
     const relationship = relationshipById(drag.routeId);
     drag.routeId = null;
 
     if (relationship && drag.moved) {
       const after = relationship.routeOffset;
+      const afterCross = relationship.routeOffsetCross;
+      const afterPoints = clonePoints(relationship.waypoints);
+
+      // A drag past the three-pixel threshold whose snapped distance is still zero moved nothing.
+      // The corner commit has said so since it was written; this one fired on drag.moved alone, so
+      // a four-pixel slip on a hand-routed line marked the diagram unsaved and pushed an undo step
+      // that undid nothing.
+      if (after === drag.origin.offset && afterCross === drag.origin.cross &&
+          samePinning(afterPoints, drag.origin.waypoints)) return;
+
       relationship.routeOffset = drag.origin.offset;
-      mutate('move connector', () => { relationship.routeOffset = after; });
+      relationship.routeOffsetCross = drag.origin.cross;
+
+      // Left alone on a connector that has none, so an ordinary offset drag does not write an empty
+      // list onto a relationship whose routing the gesture never touched.
+      const carriesCorners = afterPoints.length || drag.origin.waypoints.length;
+      if (carriesCorners) relationship.waypoints = clonePoints(drag.origin.waypoints);
+
+      mutate('move connector', () => {
+        relationship.routeOffset = after;
+        relationship.routeOffsetCross = afterCross;
+        if (carriesCorners) relationship.waypoints = afterPoints;
+      });
+      render();
+    }
+
+    return;
+  }
+
+  if (mode === 'row') {
+    const table = tableById(drag.rowTableId);
+    drag.rowTableId = null;
+
+    if (table && drag.moved) {
+      const after = table.columnOrder;
+      table.columnOrder = drag.origin.order;
+      mutate('move column', () => { table.columnOrder = after; });
       render();
     }
 
@@ -1188,14 +1827,27 @@ function onKeyDown(event) {
   }
 
   if (event.key === 'Escape') {
-    // Escape backs out of the most recent thing first: connect mode, then an open note, then a
-    // path highlight, then the selection. Clearing them all at once would take away context the
-    // user was still using.
+    // Escape backs out of the most recent thing first: connect mode, then a draw tool, then a drag
+    // in flight, then an open note, then a path highlight, then the selection. Clearing them all at
+    // once would take away context the user was still using.
     if (state.connect && state.connect.fromTableId) { endConnectMode(); return; }
 
+    // Above the drag below, and deliberately. An arrow being dragged out is both - a draw mode and
+    // a drag - and abandoning only the drag left the tool still armed, the banner still up and the
+    // half-drawn arrow still painted by renderOverlay, so it took a second Escape to be rid of it.
     if (isDrawing() || state.pendingArrow) {
       drag.mode = null;
       endDrawMode();
+      render();
+      return;
+    }
+
+    // Any other drag in flight. Without this the ladder below ran while the button was still held:
+    // the selection was cleared, which took the row grips off the card being reordered, and the
+    // card went on reordering under a pointer with nothing on screen attached to it - and the
+    // release still committed it.
+    if (drag.mode) {
+      abandonDrag();
       render();
       return;
     }
@@ -1305,7 +1957,17 @@ function onCanvasContextMenu(event) {
 }
 
 function showMenuFor(source) {
-  const hit = hitTest(source);
+  // A corner handle names its own connector. The hit test underneath is a proximity search through
+  // the document in order, with a threshold in *world* units - so zoomed out, or where two lines
+  // cross, it answers with whichever connector is nearest rather than the one the handle belongs
+  // to. The menu then opened for a different line, took the one under the pointer out of the
+  // selection, and offered to remove a bend from a connector the user had not pointed at.
+  const handle = source.target && source.target.closest
+    ? source.target.closest('[data-corner]') : null;
+
+  const hit = handle && relationshipById(handle.getAttribute('data-id'))
+    ? { kind: 'relationship', id: handle.getAttribute('data-id') }
+    : hitTest(source);
   if (hit) {
     const kind = hit.kind === 'table' ? 'tables'
       : hit.kind === 'relationship' ? 'relationships' : 'annotations';

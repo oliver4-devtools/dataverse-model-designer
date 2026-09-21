@@ -9,7 +9,7 @@
 import { el, clear, uid } from './util.js';
 import {
   state, mutate, tableById, relationshipById, removeRelationship, syncProposedLookupColumn,
-  lookupColumnName
+  clearManualRoute, lookupColumnName
 } from './state.js';
 import {
   openModal, modalFooter, toast, field, textInput, textArea, select, checkbox,
@@ -773,8 +773,17 @@ function applyRelationshipDrafts(model, table) {
       lookupTargets: []
     };
 
-    if (stored) Object.assign(stored, payload);
-    else state.doc.relationships.push(Object.assign({ highlight: null, notes: '', waypoints: [] }, payload));
+    if (stored) {
+      // See the sibling editor: hand-placed corners survive an edit to the design, but not a change
+      // of which two cards the connector joins.
+      const repointed = stored.fromTableId !== payload.fromTableId ||
+        stored.toTableId !== payload.toTableId;
+
+      Object.assign(stored, payload);
+      if (repointed) clearManualRoute(stored);
+    } else {
+      state.doc.relationships.push(Object.assign({ highlight: null, notes: '', waypoints: [] }, payload));
+    }
 
     // The lookup column the relationship implies, on the table at the many end.
     syncProposedLookupColumn(state.doc.relationships.find(r => r.id === draft.id));
@@ -1329,7 +1338,15 @@ export function openProposedRelationshipEditor(options) {
             // user has arranged the diagram, not to the design being edited here; overwriting them
             // meant reopening a connector to fix a typo in its schema name silently removed its
             // emphasis colour and any route the user had dragged.
+            //
+            // Unless the ends have changed - Swap is a button on this very dialog - because then
+            // the corners are placed around a shape the connector no longer has, and the route
+            // visits them in the reverse order and draws back over itself.
+            const repointed = target.fromTableId !== payload.fromTableId ||
+              target.toTableId !== payload.toTableId;
+
             Object.assign(target, payload);
+            if (repointed) clearManualRoute(target);
           } else {
             state.doc.relationships.push(Object.assign({ highlight: null, waypoints: [] }, payload));
           }

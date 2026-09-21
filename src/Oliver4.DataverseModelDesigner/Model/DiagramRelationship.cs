@@ -129,6 +129,17 @@ namespace Oliver4.DataverseModelDesigner.Model
         [JsonProperty("routeOffset")]
         public double RouteOffset { get; set; }
 
+        /// <summary>
+        /// How far the user dragged the middle of the connector across its own axis - the other
+        /// direction from <see cref="RouteOffset"/>. Together the two move the middle of a route
+        /// anywhere on the canvas while both end anchors stay on the columns they point at.
+        ///
+        /// Additive, so the file format version does not move: an older build ignores it and draws
+        /// the route it always drew, which is this one with the offset at zero.
+        /// </summary>
+        [JsonProperty("routeOffsetCross")]
+        public double RouteOffsetCross { get; set; }
+
         [JsonProperty("missingSinceRefresh")]
         public bool MissingSinceRefresh { get; set; }
     }

@@ -111,6 +111,19 @@ namespace Oliver4.DataverseModelDesigner.Model
         public List<AlternateKeyInfo> AlternateKeys { get; set; } = new List<AlternateKeyInfo>();
 
         /// <summary>
+        /// The order the user dragged this card's rows into, as lower-case logical names. Empty
+        /// means the ordinary rules - the column-order setting, with the keys floated to the top.
+        ///
+        /// Written against the logical name rather than the column id so that a column replaced by
+        /// one of the same name - a proposed column settling against the real one on a refresh -
+        /// keeps its place. A column the list has never heard of is drawn after the ones it has.
+        ///
+        /// Additive, so the file format version does not move.
+        /// </summary>
+        [JsonProperty("columnOrder")]
+        public List<string> ColumnOrder { get; set; } = new List<string>();
+
+        /// <summary>
         /// Set by <see cref="Services.RefreshService"/> when the table could not be found in the
         /// connected environment on the most recent refresh. Purely informational.
         /// </summary>

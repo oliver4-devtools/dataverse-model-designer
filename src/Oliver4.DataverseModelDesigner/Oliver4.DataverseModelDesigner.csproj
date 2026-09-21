@@ -20,9 +20,9 @@
          AssemblyVersion stays four-part on purpose: it is the identity the CLR binds against
          rather than something anyone reads, and it is always padded to four numbers whatever is
          written here, so shortening it would change nothing on screen. -->
-    <Version>1.10.0</Version>
-    <AssemblyVersion>1.10.0.0</AssemblyVersion>
-    <FileVersion>1.10.0</FileVersion>
+    <Version>1.11.3</Version>
+    <AssemblyVersion>1.11.3.0</AssemblyVersion>
+    <FileVersion>1.11.3</FileVersion>
 
     <Company>Oliver4</Company>
     <Authors>Oliver4</Authors>

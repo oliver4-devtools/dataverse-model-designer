@@ -1,0 +1,8 @@
+is_global = true
+build_property.RootNamespace = Oliver4.DataverseModelDesigner
+build_property.ProjectDir = /Users/david/Documents/Claude/XrmToolbox Dataverse Model Designer/Oliver4.DataverseModelDesigner/src/Oliver4.DataverseModelDesigner/
+build_property.EnableComHosting = 
+build_property.EnableGeneratedComInterfaceComImportInterop = 
+build_property.CsWinRTUseWindowsUIXamlProjections = false
+build_property.EffectiveAnalysisLevelStyle = 
+build_property.EnableCodeStyleSeverity = 
