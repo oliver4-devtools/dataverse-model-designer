@@ -6516,8 +6516,25 @@ console.log('\nBoot-order safety in app.js');
     check('and it tracks the pointer on the window, not on the legend it is dragging',
       /window\.addEventListener\('pointermove'/.test(drag) &&
       /window\.addEventListener\('pointerup'/.test(drag));
+    // 1.11.0. The rename used to be a click listener on the colour row, and 1.8.0's drag took the
+    // pointer capture on every press. While an element holds the capture the browser retargets the
+    // click to *it*, so the click arrived at #legend and the listener on the row inside it was
+    // never called: from 1.8.0 to 1.10.0 the pencil on a colour row did nothing whatsoever.
+    const press = drag.slice(drag.indexOf("addEventListener('pointerdown'"),
+      drag.indexOf("window.addEventListener('pointermove'"));
+
+    check('the legend does not take the pointer capture on the press',
+      press.length > 80 && !/setPointerCapture/.test(press),
+      press.length + ' chars');
+    check('it takes it once the press has become a drag, so a release outside the view arrives',
+      /moved = true[\s\S]{0,900}setPointerCapture/.test(drag));
+    check('a press that never moved renames the colour it went down on',
+      /if \(!drag\.moved\)[\s\S]{0,240}renameEmphasis\(drag\.colour\)/.test(drag));
     check('and a drag that ends on a colour row does not also rename that colour',
-      /legendClickSuppressed/.test(drag));
+      /if \(!drag\.moved\)/.test(drag) &&
+      drag.indexOf('renameEmphasis') > drag.indexOf('if (!drag.moved)'));
+    check('the colour is read off the row on the way down, not from a click on it',
+      /closest\('\.legend-named'\)/.test(drag) && !/addEventListener\('click'/.test(drag));
     check('and right-clicking the legend offers a way to put it back',
       /contextmenu/.test(drag) && /showLegendMenu/.test(drag));
 
@@ -6541,14 +6558,15 @@ console.log('\nBoot-order safety in app.js');
 
     // Review findings, each of which the suites were green through.
 
-    // The click that ends a drag is dispatched on the nearest ancestor of the press and the
-    // release. A drag into a corner ends with the pointer off the legend - it stops at the clamp
-    // while the pointer carries on - so a suppressor listening on the legend never fired, never
-    // cleared, and silently swallowed the next real click on a colour row.
-    check('the click suppressor listens on the window, not on the legend',
-      /window\.addEventListener\('click'/.test(drag) &&
-      !/legend\.addEventListener\('click'/.test(drag),
-      (/[^\n]*addEventListener\('click'[^\n]*/.exec(drag) || ['none'])[0].trim());
+    // The rename is driven from the release rather than from a click, so there is no click to
+    // suppress and nothing left listening for one. The suppressor this replaced was itself a fix
+    // for a click dispatched on the body at the end of a drag into a corner - which is exactly the
+    // kind of thing the release path never has to reason about.
+    const legendCss = (await import('node:fs')).readFileSync(
+      '../../src/Oliver4.DataverseModelDesigner/Web/css/app.css', 'utf8');
+
+    check('the legend still paints the pencil that says a colour row can be renamed',
+      /\.legend-named:hover::after\s*\{[^}]*content/.test(legendCss));
 
     check('a drag is dropped rather than committed when the document is replaced',
       /'document-replacing'[\s\S]{0,400}cancelLegendDrag\s*\(\s*\)/.test(appCode));
@@ -6614,8 +6632,2662 @@ console.log('\nBoot-order safety in app.js');
       /event\.buttons === 0/.test(appCode));
     check('and the drag is captured, so a release outside the view still arrives',
       /setPointerCapture/.test(drag));
+
   }
 
+}
+
+// =====================================================================
+// 1.11.0 - moving a connector in two directions, moving a field up a card,
+//          and pointing at the lookup when two cards are stacked
+// =====================================================================
+{
+  const interactions = await import(js + 'interact.js');
+  const uiModule = await import(js + 'ui.js');
+  const panelsModule = await import(js + 'panels.js');
+
+  const canvasNode = document.getElementById('canvas');
+
+  interactions.initInteractions({
+    onSelectionChange: () => {}, onContextMenu: () => {}, onOpenEditor: () => {},
+    onConnect: () => {}, onAnnotationPlaced: () => {}
+  });
+
+  // initInteractions has run more than once in this file, so the canvas carries the handlers from
+  // every earlier call. A Set sends each distinct one exactly once - they all read the same module
+  // state, so dispatching to a stale closure would drive the same drag twice.
+  const nowhere = { closest: () => null, tagName: 'svg' };
+  const pointer = (type, x, y, options) => {
+    const event = Object.assign({
+      type, pointerId: 1, clientX: x, clientY: y, button: 0,
+      shiftKey: false, ctrlKey: false, altKey: false,
+      target: nowhere,
+      preventDefault() {}, stopPropagation() {}
+    }, options || {});
+
+    for (const handler of new Set(canvasNode.listeners[type] || [])) handler(event);
+  };
+
+  const findNode = (root, predicate) => {
+    for (const child of root.childNodes) {
+      if (predicate(child)) return child;
+      const deeper = findNode(child, predicate);
+      if (deeper) return deeper;
+    }
+    return null;
+  };
+
+  const column = (id, logicalName, displayName, extra) => Object.assign({
+    id, logicalName, schemaName: logicalName, displayName,
+    typeName: 'Text (100)', isPrimaryId: false, isPrimaryName: false, isLookup: false,
+    targets: [], selected: true, status: 'Existing'
+  }, extra || {});
+
+  const card = (id, logicalName, displayName, columns) => ({
+    id, logicalName, schemaName: displayName.replace(/\s/g, ''), displayName,
+    status: 'Existing', x: 0, y: 0, collapsed: false, detailOverride: null,
+    highlight: null, notes: '', alternateKeys: [], columnOrder: [],
+    primaryIdAttribute: logicalName + 'id', primaryNameAttribute: 'name',
+    columns: [
+      column(id + 'pk', logicalName + 'id', 'Identifier', { isPrimaryId: true, typeName: 'Unique identifier' }),
+      column(id + 'nm', 'name', 'Name', { isPrimaryName: true }),
+      ...(columns || [])
+    ]
+  });
+
+  const fresh = title => {
+    state.setDocument(state.newDocument(title), null);
+    geometry.invalidateSizes();
+    return state.state.doc;
+  };
+
+  uiModule.closeModal();
+  state.clearSelection();
+
+  // -----------------------------------------------------------------
+  console.log('\n1.11.0 - a connector can be dragged in both directions');
+  // -----------------------------------------------------------------
+  //
+  // The offset was a single number along one axis, so a line could only be parted from the ones it
+  // overlapped in the one direction the route happened to allow. There are two now, and the second
+  // is written so that at zero it draws exactly the route the first one always drew - the shape
+  // must not jump as a drag crosses the axis.
+  {
+    const doc = fresh('Two axes');
+
+    const left = card('t-left', 'account', 'Account');
+    const right = card('t-right', 'contact', 'Contact', [
+      column('t-rightfk', 'parentcustomerid', 'Customer', { isLookup: true, targets: ['account'] })
+    ]);
+
+    left.x = 0; left.y = 0;
+    right.x = 600; right.y = 220;
+    doc.tables.push(left, right);
+
+    const link = {
+      id: 'r-two-axes', schemaName: 'cs_two_axes', kind: 'OneToMany', status: 'Existing',
+      fromTableId: left.id, toTableId: right.id,
+      referencedAttribute: 'accountid', referencingAttribute: 'parentcustomerid',
+      included: true, hidden: false, waypoints: [], lookupTargets: []
+    };
+    doc.relationships.push(link);
+    doc.settings.fieldDetail = 'RelationshipFields';
+    geometry.invalidateSizes();
+
+    const plain = geometry.routeRelationship(link, 0, 1);
+
+    check('the fixture is an ordinary side-to-side route with a row at each end',
+      plain.offsetAxis === 'x' && plain.crossAxis === 'y' && plain.points.length === 4,
+      plain.offsetAxis + '/' + plain.crossAxis + ' ' + plain.points.length + ' points');
+
+    link.routeOffsetCross = 0;
+    check('a cross offset of zero draws exactly the route it drew before there was one',
+      JSON.stringify(geometry.routeRelationship(link, 0, 1).points) === JSON.stringify(plain.points));
+
+    link.routeOffsetCross = 90;
+    const shifted = geometry.routeRelationship(link, 0, 1);
+
+    check('a cross offset moves the middle of the route',
+      shifted.points.some(p => Math.abs(p.y - (plain.start.y + 90)) < 0.01),
+      JSON.stringify(shifted.points));
+    check('and leaves both end anchors exactly where they were',
+      shifted.start.x === plain.start.x && shifted.start.y === plain.start.y &&
+      shifted.end.x === plain.end.x && shifted.end.y === plain.end.y);
+
+    // Every leg of the route has to stay axis-aligned, or the line stops reading as an orthogonal
+    // connector and the crossing bridges - which only look at horizontal legs - stop finding it.
+    const skew = geometry.segmentsOf(shifted.points).filter(s =>
+      Math.abs(s.a.x - s.b.x) > 0.01 && Math.abs(s.a.y - s.b.y) > 0.01);
+    check('every leg of a shifted route is still horizontal or vertical', skew.length === 0,
+      JSON.stringify(skew));
+
+    // And no leg of zero length: pathFromPoints rounds a corner from the directions either side of
+    // it, and a corner with nothing on one side has no direction to round.
+    const stalled = geometry.segmentsOf(shifted.points).filter(s =>
+      Math.abs(s.a.x - s.b.x) < 0.01 && Math.abs(s.a.y - s.b.y) < 0.01);
+    check('and none of them has zero length', stalled.length === 0, JSON.stringify(shifted.points));
+
+    // Both offsets at once is the whole point of the change.
+    link.routeOffset = 120;
+    const both = geometry.routeRelationship(link, 0, 1);
+    check('the two offsets move the route independently',
+      JSON.stringify(both.points) !== JSON.stringify(shifted.points) &&
+      both.start.y === plain.start.y && both.end.y === plain.end.y);
+
+    link.routeOffset = 0;
+    link.routeOffsetCross = 0;
+  }
+
+  // Cards with no room between them for the route to turn in.
+  //
+  // The shapes collapse rather than refuse - a cross offset that cannot be honoured draws the route
+  // it would have drawn without one - and collapsing is what puts two points on top of each other.
+  // A leg of zero length gives pathFromPoints a corner with no direction to round it from, and
+  // midpointOf a label position that is not on the drawn line.
+  {
+    const doc = fresh('No room to turn');
+
+    const left = card('n-left', 'account', 'Account');
+    const right = card('n-right', 'contact', 'Contact', [
+      column('n-rightfk', 'parentcustomerid', 'Customer', { isLookup: true, targets: ['account'] })
+    ]);
+
+    doc.tables.push(left, right);
+    doc.settings.fieldDetail = 'AllFields';
+    geometry.invalidateSizes();
+
+    left.x = 0; left.y = 0;
+    right.x = geometry.tableRect(left).width + 40; right.y = 130;
+
+    const link = {
+      id: 'r-cramped', schemaName: 'cs_cramped', kind: 'OneToMany', status: 'Existing',
+      fromTableId: left.id, toTableId: right.id,
+      referencedAttribute: 'accountid', referencingAttribute: 'parentcustomerid',
+      included: true, hidden: false, waypoints: [], lookupTargets: []
+    };
+    doc.relationships.push(link);
+    geometry.invalidateSizes();
+
+    let stalled = null;
+    let doubled = null;
+
+    for (const along of [-900, -120, -14, -1, 0, 1, 14, 120, 900]) {
+      for (const across of [-500, -60, -1, 0, 1, 60, 500]) {
+        link.routeOffset = along;
+        link.routeOffsetCross = across;
+
+        const route = geometry.routeRelationship(link, 0, 1);
+        const where = along + '/' + across + ' ' + JSON.stringify(route.points);
+
+        if (geometry.segmentsOf(route.points).some(leg =>
+          Math.abs(leg.a.x - leg.b.x) < 0.01 && Math.abs(leg.a.y - leg.b.y) < 0.01)) stalled = where;
+
+        for (let i = 1; i < route.points.length - 1; i++) {
+          const before = route.points[i - 1];
+          const here = route.points[i];
+          const after = route.points[i + 1];
+          if ((Math.abs(before.x - here.x) < 0.01 && Math.abs(here.x - after.x) < 0.01) ||
+              (Math.abs(before.y - here.y) < 0.01 && Math.abs(here.y - after.y) < 0.01)) doubled = where;
+        }
+      }
+    }
+
+    check('a route with no room to turn still has no leg of zero length', stalled === null, stalled);
+    check('and no corner that turns through nothing', doubled === null, doubled);
+
+    link.routeOffset = 0;
+    link.routeOffsetCross = 0;
+  }
+
+  // -----------------------------------------------------------------
+  console.log('\n1.11.0 - the drag writes both offsets as one undoable step');
+  // -----------------------------------------------------------------
+  {
+    const doc = fresh('Dragging both ways');
+
+    const left = card('d-left', 'account', 'Account');
+    const right = card('d-right', 'contact', 'Contact', [
+      column('d-rightfk', 'parentcustomerid', 'Customer', { isLookup: true, targets: ['account'] })
+    ]);
+
+    left.x = 0; left.y = 0;
+    right.x = 600; right.y = 220;
+    doc.tables.push(left, right);
+
+    const link = {
+      id: 'r-dragged-both', schemaName: 'cs_dragged_both', kind: 'OneToMany', status: 'Existing',
+      fromTableId: left.id, toTableId: right.id,
+      referencedAttribute: 'accountid', referencingAttribute: 'parentcustomerid',
+      included: true, hidden: false, waypoints: [], lookupTargets: []
+    };
+    doc.relationships.push(link);
+    doc.settings.fieldDetail = 'RelationshipFields';
+    geometry.invalidateSizes();
+
+    state.state.view = { zoom: 1, panX: 0, panY: 0 };
+    render.render();
+
+    const route = geometry.routeRelationship(link, 0, 1);
+    const grab = interactions.toScreen(route.label.x, route.label.y);
+
+    pointer('pointerdown', grab.x, grab.y);
+    pointer('pointermove', grab.x + 40, grab.y + 25);
+    pointer('pointerup', grab.x + 40, grab.y + 25);
+
+    check('dragging a connector diagonally writes both offsets',
+      Math.abs(link.routeOffset - 40) < 0.01 && Math.abs(link.routeOffsetCross - 25) < 0.01,
+      link.routeOffset + ' / ' + link.routeOffsetCross);
+    check('and it is one undoable step, not two',
+      state.canUndo());
+
+    state.undo();
+    const undone = state.relationshipById('r-dragged-both');
+
+    check('undo puts both back', !undone.routeOffset && !undone.routeOffsetCross,
+      undone.routeOffset + ' / ' + undone.routeOffsetCross);
+  }
+
+  // -----------------------------------------------------------------
+  console.log('\n1.11.0 - stacked cards keep the connector on the lookup field');
+  // -----------------------------------------------------------------
+  //
+  // A run between two cards one above the other met the top or bottom edge, and no point along
+  // that edge can pick out a row: the rows are stacked in the same direction. So the line pointed
+  // at the table and said nothing about which lookup it was.
+  {
+    const doc = fresh('Stacked');
+
+    const above = card('s-above', 'account', 'Account');
+    const below = card('s-below', 'contact', 'Contact', [
+      column('s-belowfk', 'parentcustomerid', 'Customer', { isLookup: true, targets: ['account'] }),
+      column('s-belowfk2', 'ownerid', 'Owner', { isLookup: true, targets: ['systemuser'] })
+    ]);
+
+    above.x = 0; above.y = 0;
+    below.x = 0; below.y = 400;
+    doc.tables.push(above, below);
+
+    const link = {
+      id: 'r-stacked', schemaName: 'cs_stacked', kind: 'OneToMany', status: 'Existing',
+      fromTableId: above.id, toTableId: below.id,
+      referencedAttribute: 'accountid', referencingAttribute: 'parentcustomerid',
+      included: true, hidden: false, waypoints: [], lookupTargets: []
+    };
+    doc.relationships.push(link);
+    doc.settings.fieldDetail = 'AllFields';
+    geometry.invalidateSizes();
+
+    const belowRect = geometry.tableRect(below);
+    const fkIndex = belowRect.rows.findIndex(row => row.column.logicalName === 'parentcustomerid');
+    const fkY = belowRect.y + geometry.METRICS.headerHeight +
+      fkIndex * geometry.METRICS.rowHeight + geometry.METRICS.rowHeight / 2;
+
+    const route = geometry.routeRelationship(link, 0, 1);
+
+    check('the fixture really is one card above the other',
+      below.y > above.y + geometry.tableRect(above).height && fkIndex > 0, String(fkIndex));
+    check('the many end points at the lookup row, not at the card',
+      Math.abs(route.end.y - fkY) < 0.01, route.end.y + ' vs ' + fkY);
+
+    const aboveRect = geometry.tableRect(above);
+    const pkY = aboveRect.y + geometry.METRICS.headerHeight + geometry.METRICS.rowHeight / 2;
+    check('and the one end points at its primary key row',
+      Math.abs(route.start.y - pkY) < 0.01, route.start.y + ' vs ' + pkY);
+
+    check('which means it leaves through the side of the card, not the bottom edge',
+      route.startSide === route.endSide &&
+      (route.startSide === 'left' || route.startSide === 'right'), route.startSide);
+
+    // Round the outside of both cards: a lane between them is where the cards are.
+    const laneX = route.points[1].x;
+    check('the lane runs outside both cards',
+      laneX > Math.max(aboveRect.x + aboveRect.width, belowRect.x + belowRect.width) ||
+      laneX < Math.min(aboveRect.x, belowRect.x), String(laneX));
+
+    check('the lane is what a drag moves, and there is no second axis to move',
+      route.offsetAxis === 'x' && route.crossAxis === null,
+      route.offsetAxis + '/' + route.crossAxis);
+
+    // Outwards, away from the cards. Inwards the lane stops at their edge, which is the one thing
+    // it is not allowed to cross - see the clamp in sameSideRoute.
+    const outwards = route.startSide === 'right' ? 70 : -70;
+    link.routeOffset = outwards;
+    const pushed = geometry.routeRelationship(link, 0, 1);
+    check('dragging it moves the lane and nothing else',
+      Math.abs(pushed.points[1].x - (laneX + outwards)) < 0.01 &&
+      pushed.start.y === route.start.y && pushed.end.y === route.end.y,
+      pushed.points[1].x + ' vs ' + (laneX + outwards));
+
+    // And never into the cards it is running beside, however far the drag goes.
+    link.routeOffset = -outwards * 40;
+    const jammed = geometry.routeRelationship(link, 0, 1);
+    const inside = jammed.points[1].x > Math.min(aboveRect.x, belowRect.x) &&
+      jammed.points[1].x < Math.max(aboveRect.x + aboveRect.width, belowRect.x + belowRect.width);
+    check('and never inside the cards it runs beside, however hard it is dragged',
+      !inside, String(jammed.points[1].x));
+
+    link.routeOffset = 0;
+
+    // A card with no columns drawn has nothing to point at, and the straight run between the two
+    // edges is the better drawing for it. That is the case the old route was right for, and it
+    // keeps it.
+    doc.settings.fieldDetail = 'TablesOnly';
+    geometry.invalidateSizes();
+
+    const bare = geometry.routeRelationship(link, 0, 1);
+    check('two cards showing no columns keep the straight top-to-bottom run',
+      bare.startSide === 'bottom' && bare.endSide === 'top',
+      bare.startSide + ' -> ' + bare.endSide);
+
+    doc.settings.fieldDetail = 'AllFields';
+    geometry.invalidateSizes();
+  }
+
+  // -----------------------------------------------------------------
+  console.log('\n1.11.0 - the fields on a card can be put in any order');
+  // -----------------------------------------------------------------
+  {
+    const doc = fresh('Field order');
+
+    const table = card('f-table', 'account', 'Account', [
+      column('f-a', 'cs_alpha', 'Alpha'),
+      column('f-b', 'cs_beta', 'Beta'),
+      column('f-c', 'cs_gamma', 'Gamma', { selected: false })
+    ]);
+
+    table.x = 0; table.y = 0;
+    doc.tables.push(table);
+    doc.settings.fieldDetail = 'AllFields';
+    geometry.invalidateSizes();
+
+    const names = () => geometry.visibleColumns(table).map(c => c.logicalName);
+
+    check('the card starts in the order the rules give it',
+      names().join(',') === 'accountid,name,cs_alpha,cs_beta', names().join(','));
+
+    // Alpha to the top, ahead of the primary key. The key float is a rule about what makes a card
+    // scannable; a hand-made order is a judgement about this drawing, and it wins.
+    table.columnOrder = geometry.cardOrderAfterMove(table, ['cs_alpha', 'accountid', 'name', 'cs_beta']);
+    geometry.invalidateSizes();
+
+    check('a hand-made order beats the key float',
+      names().join(',') === 'cs_alpha,accountid,name,cs_beta', names().join(','));
+
+    // The hidden column keeps its place rather than being pushed to one end, so turning it back on
+    // does not find it somewhere new.
+    check('a column the card is not showing keeps its place in the order',
+      table.columnOrder.includes('cs_gamma'), table.columnOrder.join(','));
+
+    const gammaAt = table.columnOrder.indexOf('cs_gamma');
+    table.columns.find(c => c.logicalName === 'cs_gamma').selected = true;
+    geometry.invalidateSizes();
+
+    check('and is drawn there when it comes back',
+      names().indexOf('cs_gamma') === gammaAt, names().join(',') + ' / ' + gammaAt);
+
+    table.columns.find(c => c.logicalName === 'cs_gamma').selected = false;
+
+    // A column the order has never heard of is drawn after the ones it has, rather than being
+    // dropped off the card altogether.
+    table.columns.push(column('f-d', 'cs_delta', 'Delta'));
+    geometry.invalidateSizes();
+    check('a column added since the order was written is drawn last, not lost',
+      names()[names().length - 1] === 'cs_delta', names().join(','));
+
+    table.columns = table.columns.filter(c => c.logicalName !== 'cs_delta');
+    table.columnOrder = [];
+    geometry.invalidateSizes();
+    check('clearing the order puts the card back the way the rules have it',
+      names().join(',') === 'accountid,name,cs_alpha,cs_beta', names().join(','));
+  }
+
+  // -----------------------------------------------------------------
+  console.log('\n1.11.0 - dragging a row grip reorders the card');
+  // -----------------------------------------------------------------
+  {
+    const doc = fresh('Row grips');
+
+    const table = card('g-table', 'account', 'Account', [
+      column('g-a', 'cs_alpha', 'Alpha'),
+      column('g-b', 'cs_beta', 'Beta')
+    ]);
+
+    table.x = 100; table.y = 100;
+    doc.tables.push(table);
+    doc.settings.fieldDetail = 'AllFields';
+    geometry.invalidateSizes();
+
+    state.state.view = { zoom: 1, panX: 0, panY: 0 };
+    state.clearSelection();
+    render.render();
+
+    const tableLayer = document.getElementById('layer-tables');
+    const gripsWhenUnselected = findNode(tableLayer,
+      node => node.hasAttribute && node.hasAttribute('data-row-grip'));
+
+    check('a card nobody has selected has no grips on it', gripsWhenUnselected === null);
+
+    state.selectOnly('tables', table.id);
+    render.render();
+
+    const gripFor = id => findNode(document.getElementById('layer-tables'),
+      node => node.hasAttribute && node.getAttribute('data-row-grip') &&
+              node.getAttribute('data-id') === id);
+
+    check('selecting it puts a grip beside each row', gripFor('g-b') !== null);
+
+    const rect = geometry.tableRect(table);
+    const rowY = index => rect.y + geometry.METRICS.headerHeight +
+      index * geometry.METRICS.rowHeight + geometry.METRICS.rowHeight / 2;
+
+    const names = () => geometry.visibleColumns(table).map(c => c.logicalName);
+    const before = names().join(',');
+
+    const from = interactions.toScreen(rect.x, rowY(3));
+    const to = interactions.toScreen(rect.x, rowY(0));
+
+    pointer('pointerdown', from.x, from.y, { target: gripFor('g-b') });
+    pointer('pointermove', to.x, to.y);
+    pointer('pointerup', to.x, to.y);
+
+    check('dragging the last row to the top puts it there',
+      names()[0] === 'cs_beta', before + ' -> ' + names().join(','));
+    check('and the rest of the card keeps its order',
+      names().join(',') === 'cs_beta,accountid,name,cs_alpha', names().join(','));
+    check('the reorder is one undoable step', state.canUndo());
+
+    state.undo();
+    geometry.invalidateSizes();
+
+    check('undo puts the card back',
+      geometry.visibleColumns(state.tableById('g-table')).map(c => c.logicalName).join(',') === before,
+      geometry.visibleColumns(state.tableById('g-table')).map(c => c.logicalName).join(','));
+
+    // The connector is anchored to a row, so moving the row moves the line. That is the reason the
+    // feature exists, and it is the thing the size cache could quietly get wrong: the rows come
+    // out of measureTable, so the order has to be part of what that cache is keyed on.
+    //
+    // Everything below works off the live document rather than the objects above: undo swaps in a
+    // clone, so `doc` and `table` name the diagram as it was before the drag and pushing into
+    // either would build the fixture in a document nothing is drawing.
+    const live = state.state.doc;
+    const liveTable = state.tableById('g-table');
+
+    const other = card('g-other', 'contact', 'Contact');
+    other.x = 900; other.y = 100;
+    live.tables.push(other);
+
+    const link = {
+      id: 'r-follows', schemaName: 'cs_follows', kind: 'OneToMany', status: 'Existing',
+      fromTableId: other.id, toTableId: liveTable.id,
+      referencedAttribute: 'contactid', referencingAttribute: 'cs_beta',
+      included: true, hidden: false, waypoints: [], lookupTargets: []
+    };
+    live.relationships.push(link);
+    geometry.invalidateSizes();
+
+    const anchoredAt = geometry.routeRelationship(link, 0, 1).end.y;
+
+    // Deliberately without calling invalidateSizes: the order is part of the cache key, so a card
+    // reordered by anything that forgets to invalidate still draws the order it was given.
+    liveTable.columnOrder = geometry.cardOrderAfterMove(liveTable,
+      ['cs_beta', 'accountid', 'name', 'cs_alpha']);
+
+    const movedTo = geometry.routeRelationship(link, 0, 1).end.y;
+    check('the connector follows its row to the new place',
+      Math.abs(movedTo - anchoredAt) > geometry.METRICS.rowHeight - 0.5,
+      anchoredAt + ' -> ' + movedTo);
+
+    liveTable.columnOrder = [];
+    geometry.invalidateSizes();
+  }
+
+  // -----------------------------------------------------------------
+  console.log('\n1.11.0 - the model list paints the colour the legend names');
+  // -----------------------------------------------------------------
+  {
+    const doc = fresh('Model list colour');
+
+    const plain = card('m-plain', 'account', 'Account');
+    const painted = card('m-painted', 'contact', 'Contact');
+    painted.highlight = '#0f7b8a';
+    doc.tables.push(plain, painted);
+    doc.settings.emphasisNames = { '#0f7b8a': 'Phase 2' };
+
+    panelsModule.showTab('model');
+
+    // Read off the nodes rather than the serialised markup: the shim carries an element's inline
+    // style on the object and does not write it into the string, so a check on the text would pass
+    // or fail for a reason that has nothing to do with the colour.
+    const marks = [];
+    (function walk(node) {
+      for (const child of node.childNodes) {
+        const classes = child.getAttribute ? (child.getAttribute('class') || '') : '';
+        if (classes.includes('status-mark')) marks.push(child);
+        walk(child);
+      }
+    })(document.getElementById('tab-model'));
+
+    // Sorted by display name, so Account then Contact.
+    const plainMark = marks[0];
+    const paintedMark = marks[1];
+
+    check('the model list has a mark for each table', marks.length === 2, String(marks.length));
+    check('a table with an emphasis colour has its mark painted in it',
+      paintedMark && paintedMark.style.background === '#0f7b8a',
+      paintedMark && paintedMark.style.background);
+    // Both, because four of the twelve emphasis colours are the same hex as a status colour and an
+    // Existing table carries no badge to tell them apart with.
+    check('and the mark says what the colour is called, and what the table is',
+      paintedMark && paintedMark.getAttribute('title') === 'Phase 2 \u00b7 Existing',
+      paintedMark && paintedMark.getAttribute('title'));
+    check('a table with no emphasis colour is left to its status colour',
+      plainMark && !plainMark.style.background &&
+      (plainMark.getAttribute('class') || '').includes('st-existing'),
+      plainMark && plainMark.getAttribute('class'));
+
+    state.clearSelection();
+  }
+
+  // -----------------------------------------------------------------
+  console.log('\n1.11.0 - what the review found, with both suites green');
+  // -----------------------------------------------------------------
+  {
+    const pair = (title, ax, ay, bx, by) => {
+      const doc = fresh(title);
+
+      const left = card('v-left', 'account', 'Account');
+      const right = card('v-right', 'contact', 'Contact', [
+        column('v-rightfk', 'parentcustomerid', 'Customer', { isLookup: true, targets: ['account'] })
+      ]);
+
+      doc.tables.push(left, right);
+      doc.settings.fieldDetail = 'AllFields';
+      geometry.invalidateSizes();
+
+      left.x = ax; left.y = ay;
+      right.x = bx; right.y = by;
+
+      const link = {
+        id: 'r-' + title, schemaName: 'cs_' + title, kind: 'OneToMany', status: 'Existing',
+        fromTableId: left.id, toTableId: right.id,
+        referencedAttribute: 'accountid', referencingAttribute: 'parentcustomerid',
+        included: true, hidden: false, waypoints: [], lookupTargets: []
+      };
+      doc.relationships.push(link);
+      geometry.invalidateSizes();
+
+      return { doc, left, right, link };
+    };
+
+    const insideAny = (point, rects) => rects.some(r =>
+      point.x > r.x + 0.01 && point.x < r.x + r.width - 0.01 &&
+      point.y > r.y + 0.01 && point.y < r.y + r.height - 0.01);
+
+    // ---- a connector that runs right to left was clamped against the wrong edge
+    //
+    // The low bound of the middle segment was not direction-corrected, so going right to left the
+    // range ran from 12 units *inside* the source card: the line left that card's left edge
+    // travelling right, back underneath the card it had just come out of.
+    {
+      const { left, right, link } = pair('rightToLeft', 600, 0, 0, 120);
+      const rects = [geometry.tableRect(left), geometry.tableRect(right)];
+
+      link.routeOffset = 400;
+      const route = geometry.routeRelationship(link, 0, 1);
+
+      check('the fixture really does run right to left', route.startSide === 'left', route.startSide);
+      check('a connector dragged hard right to left keeps its middle out of both cards',
+        !route.points.some(p => insideAny(p, rects)), JSON.stringify(route.points));
+
+      link.routeOffset = -400;
+      const other = geometry.routeRelationship(link, 0, 1);
+      check('and dragged hard the other way too',
+        !other.points.some(p => insideAny(p, rects)), JSON.stringify(other.points));
+    }
+
+    // ---- cards half a unit out of line produced a leg that was neither horizontal nor vertical
+    //
+    // The level test allowed half a unit and then treated the two ends as equal, while tidy only
+    // collapses points within 0.01. A diagonal leg gets no crossing bridge and is not bridged over,
+    // because crossingPoints only recognises a horizontal one.
+    {
+      const { link } = pair('nearlyLevel', 0, 0, 600, 0.4);
+
+      // At the anchors, which is what the level test measures. With a row at each end the two
+      // anchors are two different rows apart and the run is not level at all, so the fixture would
+      // have proved nothing about the tolerance.
+      link.referencedAttribute = null;
+      link.referencingAttribute = null;
+
+      link.routeOffset = 40;
+      link.routeOffsetCross = 40;
+      const route = geometry.routeRelationship(link, 0, 1);
+
+      const skew = geometry.segmentsOf(route.points).filter(s =>
+        Math.abs(s.a.x - s.b.x) > 0.01 && Math.abs(s.a.y - s.b.y) > 0.01);
+
+      check('the fixture really is a near-level side-to-side run',
+        Math.abs(route.start.y - route.end.y) > 0.01 &&
+        Math.abs(route.start.y - route.end.y) < 0.5,
+        route.start.y + ' vs ' + route.end.y);
+      check('two cards half a unit out of line still draw an orthogonal route',
+        skew.length === 0, JSON.stringify(skew));
+    }
+
+    {
+      const { left, right, link } = pair('nearlyLevelDown', 0, 0, 0.4, 500);
+      link.routeOffset = 40;
+      link.routeOffsetCross = 40;
+
+      // Neither card shows the column at the other end, so this is the straight top-to-bottom run.
+      left.columns = left.columns.filter(c => false);
+      right.columns = right.columns.filter(c => false);
+      geometry.invalidateSizes();
+
+      const route = geometry.routeRelationship(link, 0, 1);
+      const skew = geometry.segmentsOf(route.points).filter(s =>
+        Math.abs(s.a.x - s.b.x) > 0.01 && Math.abs(s.a.y - s.b.y) > 0.01);
+
+      check('and so does a top-to-bottom run half a unit out of line',
+        route.startSide === 'bottom' && skew.length === 0,
+        route.startSide + ' ' + JSON.stringify(skew));
+    }
+
+    // ---- one card dropped on top of another drew every leg inside them
+    {
+      // Far enough across to be a side-to-side run and still overlapping, which is the branch where
+      // the clamp between the two cards had nothing to clamp to.
+      const { left, right, link } = pair('overlapping', 0, 0, 100, 20);
+      const rects = [geometry.tableRect(left), geometry.tableRect(right)];
+
+      const route = geometry.routeRelationship(link, 0, 1);
+
+      check('the fixture really is one card lying over the other',
+        rects[1].x < rects[0].x + rects[0].width && rects[1].y < rects[0].y + rects[0].height &&
+        Math.abs(rects[1].x - rects[0].x) >= Math.abs(rects[1].y - rects[0].y),
+        JSON.stringify(rects));
+      check('a connector between two overlapping cards goes round the outside of them',
+        !route.points.some(p => insideAny(p, rects)), JSON.stringify(route.points));
+    }
+
+    // ---- an offset no drag can produce, but a hand-edited file can carry
+    {
+      const { link } = pair('infinite', 0, 0, 600, 200);
+
+      link.routeOffset = Infinity;
+      link.routeOffsetCross = -Infinity;
+
+      const route = geometry.routeRelationship(link, 0, 1);
+      check('an infinite offset does not reach the drawing',
+        route.points.every(p => Number.isFinite(p.x) && Number.isFinite(p.y)),
+        JSON.stringify(route.points));
+
+      link.routeOffset = NaN;
+      link.routeOffsetCross = NaN;
+      check('and neither does a NaN one',
+        geometry.routeRelationship(link, 0, 1).points.every(p =>
+          Number.isFinite(p.x) && Number.isFinite(p.y)));
+    }
+
+    // ---- a dead-level connector still reports the axis it is not yet using
+    //
+    // The axis is read once, at the moment of the press. Reported as null while the line is still
+    // straight, a diagonal drag off a level connector threw away half of itself.
+    {
+      const { link } = pair('levelRun', 0, 0, 600, 0);
+
+      // Neither end names a column drawn on its card, so both anchors are the middle of the header
+      // and the run is dead level.
+      link.referencedAttribute = null;
+      link.referencingAttribute = null;
+
+      const route = geometry.routeRelationship(link, 0, 1);
+
+      check('the fixture is a dead-level run with no offset on it',
+        route.points.length === 2 && route.offsetAxis === 'y', route.offsetAxis);
+      check('which still says a drag can move it along as well as across',
+        route.crossAxis === 'x', String(route.crossAxis));
+    }
+
+    // ---- the drag state machine, driven for real
+    {
+      const { left, right, link } = pair('gestures', 0, 0, 600, 220);
+      void left; void right;
+
+      state.state.view = { zoom: 1, panX: 0, panY: 0 };
+      render.render();
+
+      const grabAt = () => {
+        const route = geometry.routeRelationship(link, 0, 1);
+        return interactions.toScreen(route.label.x, route.label.y);
+      };
+
+      // A second button pressed while the first is still down. Everything in onPointerDown
+      // overwrites the drag, and the commit is keyed on the mode it finds there - so the first
+      // drag never reached its own commit while the geometry it had written live stayed on the
+      // object, with no undo entry and the diagram not even marked unsaved.
+      let grab = grabAt();
+      pointer('pointerdown', grab.x, grab.y);
+      pointer('pointermove', grab.x + 50, grab.y + 30);
+      pointer('pointerdown', grab.x + 50, grab.y + 30, { button: 2 });
+
+      check('a second press mid-drag puts the first drag back rather than abandoning it in place',
+        !link.routeOffset && !link.routeOffsetCross,
+        link.routeOffset + ' / ' + link.routeOffsetCross);
+
+      pointer('pointerup', grab.x + 50, grab.y + 30, { button: 2 });
+
+      // A pointer taken away is not a gesture finished.
+      grab = grabAt();
+      pointer('pointerdown', grab.x, grab.y);
+      pointer('pointermove', grab.x + 60, grab.y);
+      pointer('pointercancel', grab.x + 60, grab.y);
+
+      check('a cancelled pointer puts the drag back rather than committing it',
+        !link.routeOffset, String(link.routeOffset));
+
+      // Escape, with the button still held.
+      grab = grabAt();
+      pointer('pointerdown', grab.x, grab.y);
+      pointer('pointermove', grab.x + 60, grab.y);
+      window.dispatchEvent({
+        type: 'keydown', key: 'Escape', ctrlKey: false, metaKey: false, shiftKey: false,
+        target: { tagName: 'DIV' }, preventDefault() {}, stopPropagation() {}
+      });
+
+      check('Escape mid-drag puts the connector back where it was',
+        !link.routeOffset, String(link.routeOffset));
+
+      pointer('pointerup', grab.x + 60, grab.y);
+
+      check('and the release after it commits nothing',
+        !link.routeOffset && !state.canUndo(),
+        link.routeOffset + ' / ' + state.canUndo());
+
+      // Ctrl+Z mid-drag replaces the document with a clone. The drag was holding ids and an origin
+      // from the document that has gone; committing wrote that origin onto the new document's
+      // objects and took an undo snapshot from it, so the top of the stack then restored a value
+      // from the branch of history the user had just undone past.
+      state.mutate('a step to undo', () => { link.routeOffset = 30; });
+
+      // The hit test falls back to the route cache, which is filled by a render - without one the
+      // press lands on empty canvas, starts a marquee, and the whole check passes for want of a
+      // drag to get wrong.
+      render.render();
+
+      grab = grabAt();
+      pointer('pointerdown', grab.x, grab.y);
+      pointer('pointermove', grab.x + 80, grab.y);
+
+      check('the fixture really does have a drag in flight when undo is pressed',
+        Math.abs(link.routeOffset - 110) < 0.01, String(link.routeOffset));
+
+      state.undo();
+      pointer('pointerup', grab.x + 80, grab.y);
+
+      const after = state.relationshipById(link.id);
+      check('undo mid-drag drops the drag rather than committing it into the new document',
+        after && !after.routeOffset && !state.canUndo(),
+        after && (after.routeOffset + ' / ' + state.canUndo()));
+    }
+
+    // ---- a column the order cannot name by name
+    //
+    // Both filters dropped a blank key, so a column with no logical or schema name was not in the
+    // order at all - and therefore sorted after every column that was, on a drag of two rows that
+    // had nothing to do with it.
+    {
+      const doc = fresh('Nameless column');
+
+      const table = card('x-table', 'account', 'Account', [
+        column('x-blank', '', 'Nameless', { schemaName: '' }),
+        column('x-zulu', 'cs_zulu', 'Zulu')
+      ]);
+
+      doc.tables.push(table);
+      doc.settings.fieldDetail = 'AllFields';
+      geometry.invalidateSizes();
+
+      const names = () => geometry.visibleColumns(table).map(c => c.displayName);
+      const before = names().join(',');
+
+      check('the fixture has a column with no name of any kind',
+        table.columns.some(c => !c.logicalName && !c.schemaName));
+      check('and it has a key of its own all the same',
+        geometry.columnOrderKey(table.columns.find(c => c.id === 'x-blank')) === 'x-blank',
+        geometry.columnOrderKey(table.columns.find(c => c.id === 'x-blank')));
+
+      // Swap the top two rows, which has nothing to do with the nameless one.
+      const keys = geometry.visibleColumns(table).map(geometry.columnOrderKey);
+      const swapped = keys.slice();
+      swapped[0] = keys[1];
+      swapped[1] = keys[0];
+
+      table.columnOrder = geometry.cardOrderAfterMove(table, swapped);
+      geometry.invalidateSizes();
+
+      check('a drag of two other rows leaves a nameless column exactly where it was',
+        names().indexOf('Nameless') === before.split(',').indexOf('Nameless'),
+        before + ' -> ' + names().join(','));
+    }
+
+    // ---- the way back
+    {
+      const appSource = (await import('node:fs')).readFileSync(
+        '../../src/Oliver4.DataverseModelDesigner/Web/js/app.js', 'utf8');
+
+      check('a card the user has reordered offers a way back to the ordinary order',
+        /Reset column order on this card/.test(appSource) &&
+        /function resetColumnOrder\(/.test(appSource));
+      check('and the command is only offered when there is an order to reset',
+        /\(table\.columnOrder \|\| \[\]\)\.length\s*\n?\s*\?\s*\{ text: 'Reset column order/.test(appSource),
+        (/[^\n]*Reset column order[^\n]*/.exec(appSource) || ['none'])[0].trim());
+      check('and it is one undoable step',
+        /mutate\('reset column order'/.test(appSource));
+    }
+
+    // ---- nothing that catches the mouse survives into a file
+    {
+      const doc = fresh('Exported card');
+
+      const table = card('e-table', 'account', 'Account', [
+        column('e-a', 'cs_alpha', 'Alpha'),
+        column('e-b', 'cs_beta', 'Beta')
+      ]);
+
+      doc.tables.push(table);
+      doc.settings.fieldDetail = 'AllFields';
+      geometry.invalidateSizes();
+
+      state.selectOnly('tables', table.id);
+      render.render();
+
+      const svgOut = render.buildExportSvg();
+
+      check('the export carries no row grip', !svgOut.includes('data-row-grip'), svgOut.slice(0, 200));
+      check('nor the tooltip that describes the gesture',
+        !svgOut.includes('up or down the card'));
+      check('nor anything else invisible', !svgOut.includes('transparent'), svgOut.slice(0, 200));
+
+      // Belt to those braces, and a source check on purpose: every invisible node in this drawing
+      // is gated on the selection or on forExport already, so there is no document that reaches
+      // the rule. It is there for the next hit target somebody adds without remembering either
+      // gate - which is exactly how the grip's own tooltip would have got out.
+      const renderSource = (await import('node:fs')).readFileSync(
+        '../../src/Oliver4.DataverseModelDesigner/Web/js/render.js', 'utf8');
+
+      check('and the export strips a hit target drawn with a transparent fill, not only a stroke',
+        /getAttribute\('fill'\) === 'transparent'\) node\.remove\(\)/.test(renderSource));
+      check('and takes the tooltip off a row grip the way it does off a note tag',
+        /hasAttribute\('data-note-for'\) \|\|\s*\n?\s*node\.hasAttribute\('data-row-grip'\)/.test(renderSource));
+      // By logical name: the display name is only drawn when the display-name toggle is on, and it
+      // is off by default.
+      check('while the card itself is still drawn',
+        svgOut.includes('cs_alpha') && svgOut.includes('cs_beta'), svgOut.slice(0, 300));
+
+      state.clearSelection();
+    }
+  }
+
+  // -----------------------------------------------------------------
+  console.log('\n1.11.0 - what the second review pass found in the first pass\'s fixes');
+  // -----------------------------------------------------------------
+  {
+    // ---- the direction-corrected clamp was applied to one of the two routes
+    {
+      const doc = fresh('Upward run');
+
+      const below = card('u-below', 'account', 'Account');
+      const above = card('u-above', 'contact', 'Contact');
+
+      doc.tables.push(below, above);
+      doc.settings.fieldDetail = 'TablesOnly';
+      geometry.invalidateSizes();
+
+      // Not the same x: two cards in a line take the level branch, which has no middle segment to
+      // clamp and so proves nothing about the clamp.
+      below.x = 0; below.y = 600;
+      above.x = 60; above.y = 0;
+
+      const link = {
+        id: 'r-upward', schemaName: 'cs_upward', kind: 'OneToMany', status: 'Existing',
+        fromTableId: below.id, toTableId: above.id,
+        referencedAttribute: null, referencingAttribute: null,
+        included: true, hidden: false, waypoints: [], lookupTargets: []
+      };
+      doc.relationships.push(link);
+      geometry.invalidateSizes();
+
+      const rects = [geometry.tableRect(below), geometry.tableRect(above)];
+      const inside = point => rects.some(r =>
+        point.x > r.x + 0.01 && point.x < r.x + r.width - 0.01 &&
+        point.y > r.y + 0.01 && point.y < r.y + r.height - 0.01);
+
+      link.routeOffset = 4000;
+      const route = geometry.routeRelationship(link, 0, 1);
+
+      check('the fixture really is a run drawn bottom to top with a middle segment to clamp',
+        route.startSide === 'top' && route.endSide === 'bottom' && route.points.length > 2,
+        route.startSide + ' ' + route.points.length + ' points');
+      check('a top-to-bottom connector dragged hard keeps its middle out of both cards',
+        !route.points.some(inside), JSON.stringify(route.points));
+
+      link.routeOffset = -4000;
+      check('and dragged hard the other way too',
+        !geometry.routeRelationship(link, 0, 1).points.some(inside),
+        JSON.stringify(geometry.routeRelationship(link, 0, 1).points));
+    }
+
+    // ---- the gestures the first pass's own fixes reached into
+    {
+      const doc = fresh('Gestures, second pass');
+
+      const left = card('p-left', 'account', 'Account');
+      const right = card('p-right', 'contact', 'Contact');
+      left.x = 0; left.y = 0;
+      right.x = 700; right.y = 0;
+      doc.tables.push(left, right);
+      doc.settings.fieldDetail = 'AllFields';
+      geometry.invalidateSizes();
+
+      state.state.view = { zoom: 1, panX: 0, panY: 0 };
+      render.render();
+
+      // An arrow being dragged out is a draw mode as well as a drag. Escape went to the drag,
+      // which left the tool armed, the banner up and the half-drawn arrow still being painted:
+      // it took a second Escape to be rid of a thing one Escape said it had cancelled.
+      interactions.startDrawMode('arrow');
+      pointer('pointerdown', 200, 200);
+      pointer('pointermove', 320, 300);
+
+      check('the fixture really is an arrow being dragged out',
+        !!state.state.pendingArrow && interactions.isDrawing(),
+        JSON.stringify(state.state.pendingArrow));
+
+      window.dispatchEvent({
+        type: 'keydown', key: 'Escape', ctrlKey: false, metaKey: false, shiftKey: false,
+        target: { tagName: 'DIV' }, preventDefault() {}, stopPropagation() {}
+      });
+
+      check('one Escape takes away the half-drawn arrow and the tool with it',
+        !state.state.pendingArrow && !interactions.isDrawing(),
+        JSON.stringify(state.state.pendingArrow) + ' / ' + interactions.isDrawing());
+      check('and nothing was committed to the diagram',
+        state.state.doc.annotations.length === 0, String(state.state.doc.annotations.length));
+
+      pointer('pointerup', 320, 300);
+
+      // The same gesture taken away by the browser rather than by the user.
+      interactions.startDrawMode('arrow');
+      pointer('pointerdown', 200, 200);
+      pointer('pointermove', 320, 300);
+      pointer('pointercancel', 320, 300);
+
+      check('a cancelled pointer takes the half-drawn arrow away too',
+        !state.state.pendingArrow, JSON.stringify(state.state.pendingArrow));
+
+      interactions.endDrawMode();
+
+      // A pan is navigation rather than an edit, so an abandoned one keeps where it has got to -
+      // but the document has to be told, because only onPointerUp used to tell it and an abandoned
+      // gesture never reaches that. The canvas was panned on screen while the diagram held the old
+      // position, so the view that got saved was one nobody was looking at.
+      state.state.view = { zoom: 1, panX: 0, panY: 0 };
+      state.state.doc.view = { zoom: 1, panX: 0, panY: 0 };
+
+      pointer('pointerdown', 400, 400, { button: 2 });
+      pointer('pointermove', 500, 470, { button: 2 });
+
+      window.dispatchEvent({
+        type: 'keydown', key: 'Escape', ctrlKey: false, metaKey: false, shiftKey: false,
+        target: { tagName: 'DIV' }, preventDefault() {}, stopPropagation() {}
+      });
+
+      check('a pan abandoned mid-gesture stays where it has got to',
+        state.state.view.panX === 100 && state.state.view.panY === 70,
+        JSON.stringify(state.state.view));
+      check('and the diagram is told where that is',
+        state.state.doc.view.panX === state.state.view.panX &&
+        state.state.doc.view.panY === state.state.view.panY,
+        JSON.stringify(state.state.doc.view));
+
+      pointer('pointerup', 500, 470, { button: 2 });
+
+      // One pointer owns the gesture. A second finger starts its own drag; the first one's release
+      // then arrived as the end of that one, nulled the mode and released the capture for the wrong
+      // pointer, and the drag still under the second finger died in silence.
+      state.state.view = { zoom: 1, panX: 0, panY: 0 };
+      render.render();
+
+      const target = state.tableById('p-left');
+      const before = target.x;
+
+      // Through the card's own node: the hit test reads the element under the pointer, and its
+      // fallback by proximity only knows about connectors.
+      const cardNode = findNode(document.getElementById('layer-tables'),
+        node => node.getAttribute && node.getAttribute('data-kind') === 'table' &&
+                node.getAttribute('data-id') === 'p-left');
+
+      check('the fixture found the card to drag', cardNode !== null);
+
+      pointer('pointerdown', 40, 20, { pointerId: 1, target: cardNode });
+      pointer('pointermove', 140, 20, { pointerId: 1 });
+      pointer('pointerup', 300, 300, { pointerId: 2 });
+      pointer('pointermove', 240, 20, { pointerId: 1 });
+      pointer('pointerup', 240, 20, { pointerId: 1 });
+
+      check('a release from another pointer does not end the drag this one is making',
+        Math.abs(target.x - (before + 200)) < 0.01, before + ' -> ' + target.x);
+    }
+
+    // ---- the connector's own way back
+    {
+      const appSource = (await import('node:fs')).readFileSync(
+        '../../src/Oliver4.DataverseModelDesigner/Web/js/app.js', 'utf8');
+
+      check('a connector that has been dragged offers a way back to its automatic route',
+        /Straighten this connector/.test(appSource) &&
+        /function straightenConnector\(/.test(appSource));
+      check('and it clears both offsets, not only the one that is visible',
+        /mutate\('straighten connector'[\s\S]{0,200}routeOffset = 0;[\s\S]{0,80}routeOffsetCross = 0;/.test(appSource));
+      check('and is only offered when there is something to straighten',
+        /handRouted\(relationship\)\n\s*\? \{ text: 'Straighten this connector'/.test(appSource));
+    }
+
+    // ---- the drag starts from a number it can drag away from
+    {
+      const doc = fresh('Infinite origin');
+
+      const left = card('i-left', 'account', 'Account');
+      const right = card('i-right', 'contact', 'Contact');
+      left.x = 0; left.y = 0;
+      right.x = 700; right.y = 120;
+      doc.tables.push(left, right);
+      doc.settings.fieldDetail = 'AllFields';
+      geometry.invalidateSizes();
+
+      const link = {
+        id: 'r-infinite', schemaName: 'cs_infinite', kind: 'OneToMany', status: 'Existing',
+        fromTableId: left.id, toTableId: right.id,
+        referencedAttribute: null, referencingAttribute: null,
+        included: true, hidden: false, waypoints: [], lookupTargets: [],
+        routeOffset: Infinity, routeOffsetCross: Infinity
+      };
+      doc.relationships.push(link);
+      geometry.invalidateSizes();
+
+      state.state.view = { zoom: 1, panX: 0, panY: 0 };
+      render.render();
+
+      const route = geometry.routeRelationship(link, 0, 1);
+      const grab = interactions.toScreen(route.label.x, route.label.y);
+
+      pointer('pointerdown', grab.x, grab.y);
+      pointer('pointermove', grab.x + 40, grab.y + 20);
+      pointer('pointerup', grab.x + 40, grab.y + 20);
+
+      check('a connector carrying an infinite offset can be dragged to a real one',
+        Number.isFinite(link.routeOffset) && Number.isFinite(link.routeOffsetCross),
+        link.routeOffset + ' / ' + link.routeOffsetCross);
+    }
+
+    // ---- the inspector lists a card in the order the card is in
+    {
+      const doc = fresh('Inspector order');
+
+      const table = card('n-table', 'account', 'Account', [
+        column('n-a', 'cs_alpha', 'Alpha'),
+        column('n-b', 'cs_beta', 'Beta')
+      ]);
+
+      doc.tables.push(table);
+      doc.settings.fieldDetail = 'AllFields';
+      geometry.invalidateSizes();
+
+      table.columnOrder = geometry.cardOrderAfterMove(table,
+        ['cs_beta', 'accountid', 'name', 'cs_alpha']);
+      geometry.invalidateSizes();
+
+      const inspector = await import(js + 'inspector.js');
+      state.selectOnly('tables', table.id);
+      inspector.refreshInspector();
+
+      const body = new XMLSerializer().serializeToString(document.getElementById('inspector-body'));
+      const order = ['Beta', 'Identifier', 'Name', 'Alpha'].map(name => body.indexOf(name));
+
+      check('the inspector lists the columns in the order the card draws them',
+        order.every((at, index) => at >= 0 && (index === 0 || at > order[index - 1])),
+        order.join(','));
+
+      inspector.hideInspector();
+      state.clearSelection();
+    }
+
+    // ---- the grip marks sit in the middle of the grip
+    {
+      const doc = fresh('Grip marks');
+
+      const table = card('k-table', 'account', 'Account', [
+        column('k-a', 'cs_alpha', 'Alpha')
+      ]);
+
+      doc.tables.push(table);
+      doc.settings.fieldDetail = 'AllFields';
+      geometry.invalidateSizes();
+
+      state.selectOnly('tables', table.id);
+      render.render();
+
+      const layer = document.getElementById('layer-tables');
+      const gripRect = findNode(layer, node => node.hasAttribute &&
+        node.getAttribute('rx') === '2.5' && node.hasAttribute('fill-opacity'));
+      const marks = findNode(layer, node => node.hasAttribute && node.tagName === 'path' &&
+        /^M -\d+(\.\d+)? [\d.]+ h 6/.test(node.getAttribute('d') || ''));
+
+      check('the grip is drawn with a mark inside it', gripRect !== null && marks !== null);
+
+      if (gripRect && marks) {
+        const gripLeft = Number(gripRect.getAttribute('x'));
+        const gripRight = gripLeft + Number(gripRect.getAttribute('width'));
+        const markLeft = Number(/^M (-?[\d.]+)/.exec(marks.getAttribute('d'))[1]);
+        const markRight = markLeft + 6;
+
+        check('and the mark is centred in it rather than shoved against one edge',
+          Math.abs((markLeft - gripLeft) - (gripRight - markRight)) < 0.51,
+          'grip ' + gripLeft + '..' + gripRight + ', mark ' + markLeft + '..' + markRight);
+      }
+
+      state.clearSelection();
+    }
+  }
+
+  uiModule.closeModal();
+  state.clearSelection();
+  state.state.view = { zoom: 1, panX: 0, panY: 0 };
+}
+
+// =====================================================================
+// 1.11.1 - the corners of a connector move one at a time
+// =====================================================================
+//
+// Both offsets move the *whole* middle of a route: the shape is two numbers, so every part of it
+// that can move moves together. What David wanted is a corner that goes where he puts it while the
+// rest of the line stays where it is - which no pair of numbers can express, because keeping the
+// line orthogonal round a corner that has moved in both directions means turning extra corners
+// either side of it. So a corner is a *point the route passes through*, kept on the relationship,
+// and the router works the connecting legs out around it.
+{
+  const interactions = await import(js + 'interact.js');
+  const uiModule = await import(js + 'ui.js');
+
+  const canvasNode = document.getElementById('canvas');
+
+  interactions.initInteractions({
+    onSelectionChange: () => {}, onContextMenu: () => {}, onOpenEditor: () => {},
+    onConnect: () => {}, onAnnotationPlaced: () => {}
+  });
+
+  const nowhere = { closest: () => null, tagName: 'svg' };
+  const pointer = (type, x, y, options) => {
+    const event = Object.assign({
+      type, pointerId: 1, clientX: x, clientY: y, button: 0,
+      shiftKey: false, ctrlKey: false, altKey: false,
+      target: nowhere,
+      preventDefault() {}, stopPropagation() {}
+    }, options || {});
+
+    for (const handler of new Set(canvasNode.listeners[type] || [])) handler(event);
+  };
+
+  const findNode = (root, predicate) => {
+    for (const child of root.childNodes) {
+      if (predicate(child)) return child;
+      const deeper = findNode(child, predicate);
+      if (deeper) return deeper;
+    }
+    return null;
+  };
+
+  // The handles live in the overlay layer, above the cards, the front annotations and every other
+  // connector's invisible hit stroke - all three of which used to stand over them.
+  const handleFor = (linkId, index) => findNode(document.getElementById('layer-overlay'), node =>
+    node.getAttribute && node.getAttribute('data-corner') === String(index) &&
+    node.getAttribute('data-id') === linkId);
+
+  const column = (id, logicalName, displayName, extra) => Object.assign({
+    id, logicalName, schemaName: logicalName, displayName,
+    typeName: 'Text (100)', isPrimaryId: false, isPrimaryName: false, isLookup: false,
+    targets: [], selected: true, status: 'Existing'
+  }, extra || {});
+
+  const card = (id, logicalName, displayName, columns) => ({
+    id, logicalName, schemaName: displayName.replace(/\s/g, ''), displayName,
+    status: 'Existing', x: 0, y: 0, collapsed: false, detailOverride: null,
+    highlight: null, notes: '', alternateKeys: [], columnOrder: [],
+    primaryIdAttribute: logicalName + 'id', primaryNameAttribute: 'name',
+    columns: [
+      column(id + 'pk', logicalName + 'id', 'Identifier', { isPrimaryId: true, typeName: 'Unique identifier' }),
+      column(id + 'nm', 'name', 'Name', { isPrimaryName: true }),
+      ...(columns || [])
+    ]
+  });
+
+  const link = (id, from, to, extra) => Object.assign({
+    id, schemaName: 'cs_' + id, kind: 'OneToMany', status: 'Existing',
+    fromTableId: from, toTableId: to,
+    referencedAttribute: null, referencingAttribute: null,
+    included: true, hidden: false, waypoints: [], lookupTargets: []
+  }, extra || {});
+
+  const fresh = title => {
+    state.setDocument(state.newDocument(title), null);
+    geometry.invalidateSizes();
+    return state.state.doc;
+  };
+
+  const shape = points => points.map(p => Math.round(p.x) + ',' + Math.round(p.y)).join(' ');
+
+  /** Every leg of a route, and whether any of them is neither horizontal nor vertical. */
+  const diagonals = points => geometry.segmentsOf(points).filter(seg =>
+    Math.abs(seg.a.x - seg.b.x) > 0.01 && Math.abs(seg.a.y - seg.b.y) > 0.01);
+
+  uiModule.closeModal();
+  state.clearSelection();
+
+  // -----------------------------------------------------------------
+  console.log('\n1.11.1 - pinning a route\'s own corners draws exactly the route it already drew');
+  // -----------------------------------------------------------------
+  //
+  // The single most important property of the whole feature, and the one that is invisible when it
+  // works: a drag begins by pinning every corner of the drawn route, so if the router did not
+  // reproduce an automatic shape from its own corners, every connector would jump the moment it
+  // was grabbed - before the pointer had moved anywhere.
+  {
+    // Each fixture is checked where it is built. fresh() replaces the whole document, so a
+    // relationship kept for later names tables that are no longer in it and routes to null - which
+    // is a check that passes by never running rather than a check that passes.
+    // Each fixture is checked where it is built, by this. fresh() replaces the whole document, so
+    // a relationship kept in a list for later names tables that are no longer in it and routes to
+    // null - a check that passes by never running rather than a check that passes.
+    const verify = (name, rel) => {
+      const before = geometry.routeRelationship(rel, 0, 1);
+
+      check('the ' + name + ' fixture has corners to pin',
+        before.corners.length >= 2 && !before.manual,
+        before.corners.length + ' corners');
+
+      check('and none of them is pinned yet',
+        before.corners.every(corner => corner.waypointIndex === null));
+
+      rel.waypoints = before.corners.map(corner => ({ x: corner.x, y: corner.y }));
+      const after = geometry.routeRelationship(rel, 0, 1);
+
+      check('pinning them redraws the ' + name + ' route point for point',
+        shape(after.points) === shape(before.points),
+        shape(before.points) + '  ->  ' + shape(after.points));
+      check('and it knows it is hand-routed now', after.manual === true);
+      check('and both ends are still exactly where they were - ' + name,
+        after.start.x === before.start.x && after.start.y === before.start.y &&
+        after.end.x === before.end.x && after.end.y === before.end.y);
+
+      // Pinning a route's own corners is where hops collapse to a single leg, and a bend pushed on
+      // top of the pinned point it was heading for is dropped by tidy in favour of the *untagged*
+      // copy. The handle for the pinned corner is then drawn a second time beside it: two gestures
+      // on one pixel, one moving that corner and one inserting another next to it.
+      const stacked = after.corners.filter((corner, at) => after.corners.some((other, when) =>
+        when !== at && Math.abs(other.x - corner.x) < 0.01 && Math.abs(other.y - corner.y) < 0.01));
+
+      check('and no two handles land on the same point - ' + name,
+        stacked.length === 0, JSON.stringify(stacked));
+
+      rel.waypoints = [];
+    };
+
+    // Side to side, a row at each end.
+    {
+      const doc = fresh('Pin side to side');
+      const left = card('p-left', 'account', 'Account');
+      const right = card('p-right', 'contact', 'Contact', [
+        column('p-rightfk', 'parentcustomerid', 'Customer', { isLookup: true, targets: ['account'] })
+      ]);
+      left.x = 0; left.y = 0;
+      right.x = 600; right.y = 220;
+      doc.tables.push(left, right);
+      doc.settings.fieldDetail = 'RelationshipFields';
+      const rel = link('r-pin-side', left.id, right.id,
+        { referencedAttribute: 'accountid', referencingAttribute: 'parentcustomerid' });
+      doc.relationships.push(rel);
+      geometry.invalidateSizes();
+      verify('side to side', rel);
+    }
+
+    // The same route with a cross offset on it, which is the eight-point shape with a step at
+    // each end - the one with the most corners to get wrong.
+    {
+      const doc = fresh('Pin stepped');
+      const left = card('q-left', 'account', 'Account');
+      const right = card('q-right', 'contact', 'Contact', [
+        column('q-rightfk', 'parentcustomerid', 'Customer', { isLookup: true, targets: ['account'] })
+      ]);
+      left.x = 0; left.y = 0;
+      right.x = 600; right.y = 220;
+      doc.tables.push(left, right);
+      doc.settings.fieldDetail = 'RelationshipFields';
+      const rel = link('r-pin-step', left.id, right.id, {
+        referencedAttribute: 'accountid', referencingAttribute: 'parentcustomerid',
+        routeOffset: 30, routeOffsetCross: 60
+      });
+      doc.relationships.push(rel);
+      geometry.invalidateSizes();
+      verify('a route with a step at each end', rel);
+    }
+
+    // Straight down, neither card showing a column, so there is no row to point at.
+    {
+      const doc = fresh('Pin top to bottom');
+      const above = card('v-above', 'account', 'Account');
+      const below = card('v-below', 'contact', 'Contact');
+      above.x = 0; above.y = 0;
+      below.x = 40; below.y = 400;
+      doc.tables.push(above, below);
+      doc.settings.fieldDetail = 'TablesOnly';
+      const rel = link('r-pin-vert', above.id, below.id);
+      doc.relationships.push(rel);
+      geometry.invalidateSizes();
+      verify('top to bottom', rel);
+    }
+
+    // Stacked with rows to point at, so the route goes round the outside - one degree of freedom,
+    // both arms at their rows.
+    {
+      const doc = fresh('Pin same side');
+      const above = card('w-above', 'account', 'Account');
+      const below = card('w-below', 'contact', 'Contact', [
+        column('w-belowfk', 'parentcustomerid', 'Customer', { isLookup: true, targets: ['account'] })
+      ]);
+      above.x = 0; above.y = 0;
+      below.x = 10; below.y = 260;
+      doc.tables.push(above, below);
+      doc.settings.fieldDetail = 'RelationshipFields';
+      const rel = link('r-pin-same', above.id, below.id,
+        { referencedAttribute: 'accountid', referencingAttribute: 'parentcustomerid' });
+      doc.relationships.push(rel);
+      geometry.invalidateSizes();
+      verify('round the outside of two stacked cards', rel);
+    }
+
+    // A relationship from a table to itself, which is drawn as a loop off the right-hand edge.
+    {
+      const doc = fresh('Pin self');
+      const only = card('x-self', 'account', 'Account');
+      only.x = 100; only.y = 100;
+      doc.tables.push(only);
+      doc.settings.fieldDetail = 'TablesOnly';
+      const rel = link('r-pin-self', only.id, only.id);
+      doc.relationships.push(rel);
+      geometry.invalidateSizes();
+      verify('a self-referencing loop', rel);
+    }
+  }
+
+  // -----------------------------------------------------------------
+  console.log('\n1.11.1 - a hand-placed corner is where the route turns');
+  // -----------------------------------------------------------------
+  //
+  // These drive the router directly, which is what a hand-edited file does. Every drag in the tool
+  // moves the legs of the route it is already drawing, so the lists it writes always alternate
+  // horizontal and vertical - but a file can carry anything, and the shapes below are what the
+  // router has to make of the awkward ones.
+  {
+    const doc = fresh('One corner');
+
+    const left = card('m-left', 'account', 'Account');
+    const right = card('m-right', 'contact', 'Contact', [
+      column('m-rightfk', 'parentcustomerid', 'Customer', { isLookup: true, targets: ['account'] })
+    ]);
+    left.x = 0; left.y = 0;
+    right.x = 600; right.y = 220;
+    doc.tables.push(left, right);
+    doc.settings.fieldDetail = 'RelationshipFields';
+
+    const rel = link('r-one-corner', left.id, right.id,
+      { referencedAttribute: 'accountid', referencingAttribute: 'parentcustomerid' });
+    doc.relationships.push(rel);
+    geometry.invalidateSizes();
+
+    const before = geometry.routeRelationship(rel, 0, 1);
+    const pinned = before.corners.map(corner => ({ x: corner.x, y: corner.y }));
+
+    check('the fixture is the ordinary two-corner route', pinned.length === 2, String(pinned.length));
+
+    const second = { x: pinned[1].x, y: pinned[1].y };
+    pinned[0] = { x: pinned[0].x - 90, y: pinned[0].y - 70 };
+    rel.waypoints = pinned;
+
+    const moved = geometry.routeRelationship(rel, 0, 1);
+
+    check('a corner off the alternating shape is still on the route where it was put',
+      moved.points.some(point =>
+        Math.abs(point.x - pinned[0].x) < 0.01 && Math.abs(point.y - pinned[0].y) < 0.01),
+      shape(moved.points));
+    check('the other corner has not moved',
+      moved.points.some(point =>
+        Math.abs(point.x - second.x) < 0.01 && Math.abs(point.y - second.y) < 0.01),
+      shape(moved.points));
+    check('neither end has moved',
+      moved.start.x === before.start.x && moved.start.y === before.start.y &&
+      moved.end.x === before.end.x && moved.end.y === before.end.y);
+    check('every leg is still horizontal or vertical',
+      diagonals(moved.points).length === 0, shape(moved.points));
+    check('the first leg still leaves the card through its own side',
+      Math.abs(moved.points[0].y - moved.points[1].y) < 0.01, shape(moved.points));
+    check('and the last leg still arrives at the other card through its own side',
+      Math.abs(moved.points[moved.points.length - 1].y - moved.points[moved.points.length - 2].y) < 0.01,
+      shape(moved.points));
+
+    // The invariant every corner gesture is built on: the drag bakes the corners as the route's
+    // own points and then moves one of them by index, so a corner list that does not line up
+    // one-for-one with the drawn line would move the wrong part of it.
+    const lines = points => points.slice(1, -1).map(p => Math.round(p.x) + ',' + Math.round(p.y)).join(' ');
+
+    check('and there is exactly one corner per interior point of the drawn line, in order',
+      lines(moved.points) === moved.corners.map(c => Math.round(c.x) + ',' + Math.round(c.y)).join(' '),
+      lines(moved.points) + '  |  ' + moved.corners.map(c => Math.round(c.x) + ',' + Math.round(c.y)).join(' '));
+
+    // A corner pulled back past its neighbour is a leg that goes out and comes straight back. tidy
+    // used to remove it as a straight run without ever asking whether it lay *between* the two
+    // beside it, so the drawn line came out identical to the one before and the corner's handle was
+    // left in mid-air off the end of it.
+    rel.waypoints = [{ x: second.x, y: before.corners[0].y }, { x: second.x - 60, y: second.y }];
+    const excursion = geometry.routeRelationship(rel, 0, 1);
+
+    check('a corner pulled back past its neighbour is still on the drawn line',
+      excursion.points.some(point =>
+        Math.abs(point.x - (second.x - 60)) < 0.01 && Math.abs(point.y - second.y) < 0.01),
+      shape(excursion.points));
+    check('and every handle is on the drawn line',
+      excursion.corners.every(corner =>
+        geometry.distanceToPolyline(corner, excursion.points) < 0.01),
+      JSON.stringify(excursion.corners.map(c => [c.x, c.y])));
+
+    // An automatic route can make the same shape when an offset is dragged past its clamp, and
+    // there the excursion is a wrinkle in a shape nobody asked for point by point. It has always
+    // been tidied away and sparing it would change a drawing that has nothing to do with this.
+    rel.waypoints = [];
+    rel.routeOffset = 900;
+    rel.routeOffsetCross = 500;
+
+    const stretched = geometry.routeRelationship(rel, 0, 1);
+    const doublesBack = stretched.points.some((point, at) => {
+      if (at === 0 || at === stretched.points.length - 1) return false;
+      const back = stretched.points[at - 1];
+      const on = stretched.points[at + 1];
+      return (Math.abs(back.x - point.x) < 0.01 && Math.abs(point.x - on.x) < 0.01 &&
+              (point.y < Math.min(back.y, on.y) - 0.01 || point.y > Math.max(back.y, on.y) + 0.01)) ||
+             (Math.abs(back.y - point.y) < 0.01 && Math.abs(point.y - on.y) < 0.01 &&
+              (point.x < Math.min(back.x, on.x) - 0.01 || point.x > Math.max(back.x, on.x) + 0.01));
+    });
+
+    check('an automatic route dragged past its clamp is still tidied flat',
+      !doublesBack, shape(stretched.points));
+
+    rel.routeOffset = 0;
+    rel.routeOffsetCross = 0;
+
+    // One corner, and not at the height of either anchor, so the *last* hop has two legs to get in
+    // the right order. Every other fixture here keeps a corner at the end anchor's own row, where
+    // that hop collapses to a single leg and gets the order right whatever the rule says.
+    rel.waypoints = [{ x: 300, y: -120 }];
+    const single = geometry.routeRelationship(rel, 0, 1);
+    const tail = single.points.slice(-2);
+
+    check('a route with one corner well off both rows still arrives through the card\'s side',
+      Math.abs(tail[0].y - tail[1].y) < 0.01, shape(single.points));
+    check('and still leaves through the other card\'s side',
+      Math.abs(single.points[0].y - single.points[1].y) < 0.01, shape(single.points));
+    check('and turns a corner at the point that was pinned',
+      single.points.some(point =>
+        Math.abs(point.x - 300) < 0.01 && Math.abs(point.y + 120) < 0.01), shape(single.points));
+
+    // One corner at the height of the anchor it comes from, so the hop that reaches it is a single
+    // horizontal leg and the route arrives at it travelling the way the end card's side faces. Two
+    // legs can then both turn there and come in to the card correctly, and taking three anyway
+    // would set off along the leg that got there - leaving the corner on a straight run, where tidy
+    // drops it and the route stops passing through it at all.
+    rel.waypoints = [{ x: 300, y: single.start.y }];
+    const level = geometry.routeRelationship(rel, 0, 1);
+    const at = level.points.findIndex(point => Math.abs(point.x - 300) < 0.01 &&
+      Math.abs(point.y - single.start.y) < 0.01);
+
+    check('a corner level with the anchor it comes from is a corner, not a point on a straight run',
+      at > 0 && at < level.points.length - 1 &&
+      Math.abs(level.points[at - 1].y - level.points[at].y) < 0.01 &&
+      Math.abs(level.points[at + 1].x - level.points[at].x) < 0.01,
+      shape(level.points));
+    check('and the route still arrives through the other card\'s side',
+      Math.abs(level.points[level.points.length - 1].y - level.points[level.points.length - 2].y) < 0.01,
+      shape(level.points));
+
+    rel.waypoints = [];
+  }
+
+  // -----------------------------------------------------------------
+  console.log('\n1.11.1 - a corner that is not a pair of finite numbers is not a corner');
+  // -----------------------------------------------------------------
+  //
+  // The same guard both offsets have carried since 1.11.0, and for the same reason: a corner is a
+  // point on the drawn route, so an infinite one reaches documentBounds and hands Fit and every
+  // picture export a drawing with no finite extent. No drag can produce one; a hand-edited file
+  // can.
+  {
+    const doc = fresh('Rotten corners');
+
+    const left = card('z-left', 'account', 'Account');
+    const right = card('z-right', 'contact', 'Contact');
+    left.x = 0; left.y = 0;
+    right.x = 700; right.y = 120;
+    doc.tables.push(left, right);
+    doc.settings.fieldDetail = 'TablesOnly';
+
+    const rel = link('r-rotten', left.id, right.id);
+    doc.relationships.push(rel);
+    geometry.invalidateSizes();
+
+    const clean = geometry.routeRelationship(rel, 0, 1);
+
+    rel.waypoints = [null, { x: Infinity, y: 10 }, { x: 10, y: NaN }, { x: '40', y: '80' }];
+    const guarded = geometry.routeRelationship(rel, 0, 1);
+
+    check('a null, an infinite and a NaN corner are all dropped',
+      guarded.points.every(point => Number.isFinite(point.x) && Number.isFinite(point.y)),
+      shape(guarded.points));
+    check('and the one readable corner is still honoured, string coordinates and all',
+      guarded.points.some(point => Math.abs(point.x - 40) < 0.01) &&
+      guarded.corners.some(corner => corner.waypointIndex === 0 &&
+        Math.abs(corner.x - 40) < 0.01 && Math.abs(corner.y - 80) < 0.01),
+      shape(guarded.points));
+
+    rel.waypoints = [{ x: Infinity, y: Infinity }];
+    check('a connector whose only corner is unusable goes back to its automatic route',
+      shape(geometry.routeRelationship(rel, 0, 1).points) === shape(clean.points));
+
+    rel.waypoints = 'not a list';
+    check('and so does one whose corners are not a list at all',
+      shape(geometry.routeRelationship(rel, 0, 1).points) === shape(clean.points));
+
+    rel.waypoints = [];
+  }
+
+  // -----------------------------------------------------------------
+  console.log('\n1.11.1 - dragging a corner moves the legs that meet at it');
+  // -----------------------------------------------------------------
+  //
+  // The first cut of this made a corner a point the route had to pass through and let it go
+  // anywhere, turning whatever extra bends it took to reach it. David's own words on seeing it:
+  // "it drags the line out and creates an additional bend. I don't want it to do that. I just want
+  // it to move the existing lines." So a corner drag moves the two legs meeting at it and nothing
+  // else - and a leg held at one of the two anchors does not move at all, which is why a corner
+  // next to a card slides one way only.
+  {
+    const interactions = await import(js + 'interact.js');
+    const uiModule = await import(js + 'ui.js');
+
+    const canvasNode = document.getElementById('canvas');
+
+    interactions.initInteractions({
+      onSelectionChange: () => {}, onContextMenu: () => {}, onOpenEditor: () => {},
+      onConnect: () => {}, onAnnotationPlaced: () => {}
+    });
+
+    const nowhere = { closest: () => null, tagName: 'svg' };
+    const pointer = (type, x, y, options) => {
+      const event = Object.assign({
+        type, pointerId: 1, clientX: x, clientY: y, button: 0,
+        shiftKey: false, ctrlKey: false, altKey: false,
+        target: nowhere,
+        preventDefault() {}, stopPropagation() {}
+      }, options || {});
+
+      for (const handler of new Set(canvasNode.listeners[type] || [])) handler(event);
+    };
+
+    const findNode = (root, predicate) => {
+      for (const child of root.childNodes) {
+        if (predicate(child)) return child;
+        const deeper = findNode(child, predicate);
+        if (deeper) return deeper;
+      }
+      return null;
+    };
+
+    // The handles live in the overlay layer, above the cards, the front annotations and every other
+    // connector's invisible hit stroke - all three of which used to stand over them.
+    const handleFor = (linkId, index) => findNode(document.getElementById('layer-overlay'), node =>
+      node.getAttribute && node.getAttribute('data-corner') === String(index) &&
+      node.getAttribute('data-id') === linkId);
+
+    const build = (title, extra) => {
+      const doc = fresh(title);
+
+      const left = card('h-left', 'account', 'Account');
+      const right = card('h-right', 'contact', 'Contact', [
+        column('h-rightfk', 'parentcustomerid', 'Customer', { isLookup: true, targets: ['account'] })
+      ]);
+      left.x = 0; left.y = 0;
+      right.x = 600; right.y = 220;
+      doc.tables.push(left, right);
+      doc.settings.fieldDetail = 'RelationshipFields';
+
+      const rel = link('r-handle', left.id, right.id, Object.assign({
+        referencedAttribute: 'accountid', referencingAttribute: 'parentcustomerid'
+      }, extra || {}));
+      doc.relationships.push(rel);
+      geometry.invalidateSizes();
+
+      state.state.view = { zoom: 1, panX: 0, panY: 0 };
+      state.selectOnly('relationships', rel.id);
+      render.render();
+
+      return rel;
+    };
+
+    const drag = (rel, index, dx, dy, options) => {
+      state.selectOnly('relationships', rel.id);
+      render.render();
+
+      const route = geometry.routeRelationship(rel, 0, 1);
+      const corner = route.corners[index];
+      const handle = handleFor(rel.id, index);
+      const at = interactions.toScreen(corner.x, corner.y);
+      const held = Object.assign({ target: handle }, options || {});
+
+      pointer('pointerdown', at.x, at.y, held);
+      pointer('pointermove', at.x + dx, at.y + dy, held);
+      pointer('pointerup', at.x + dx, at.y + dy, held);
+
+      // Checked after *every* drag in this block, because a control that vanishes is the one kind
+      // of defect a fixture aimed somewhere else will never notice. A leg dragged all the way onto
+      // the card it ends on has no length left; tidy drops it, the two corners either side collapse
+      // into one with a card at both ends, and a connector halfway through being shaped loses every
+      // handle it had.
+      state.selectOnly('relationships', rel.id);
+      render.render();
+
+      const left = geometry.routeRelationship(rel, 0, 1);
+      check('and the line still has a handle to carry on with',
+        (left.corners || []).some(entry => entry.carryX || entry.carryY),
+        JSON.stringify((left.corners || []).map(c => [c.carryX, c.carryY])));
+
+      return { route, corner, handle };
+    };
+
+    uiModule.closeModal();
+    state.clearSelection();
+
+    // ---- which way a corner can go, and what goes with it
+    {
+      const rel = build('Freedom');
+      const route = geometry.routeRelationship(rel, 0, 1);
+
+      check('the fixture is the ordinary two-corner route', route.corners.length === 2,
+        String(route.corners.length));
+
+      // Out of the first card's side, up or down, into the second card's side. Both legs touching a
+      // card are held on the column the relationship points at, so neither corner can move
+      // vertically - and the leg between them is the one both of them carry.
+      check('a corner next to a card can only slide along the card\'s own face',
+        !route.corners[0].carryY && !route.corners[1].carryY,
+        JSON.stringify(route.corners.map(c => [c.carryX, c.carryY])));
+      check('and moving it carries the leg to the corner beyond it',
+        JSON.stringify(route.corners[0].carryX) === '[1]' &&
+        JSON.stringify(route.corners[1].carryX) === '[0]',
+        JSON.stringify(route.corners.map(c => c.carryX)));
+
+      const { corner } = drag(rel, 0, -92, -72);
+
+      check('dragging it moves both ends of that leg together',
+        rel.waypoints.length === 2 &&
+        Math.abs(rel.waypoints[0].x - rel.waypoints[1].x) < 0.01,
+        JSON.stringify(rel.waypoints));
+      check('and takes it to where the pointer went, along the axis it can travel on',
+        Math.abs(rel.waypoints[0].x - (corner.x - 92)) <= 2.01,
+        'from ' + corner.x + ' by -92 -> ' + rel.waypoints[0].x);
+      check('and does not move it on the axis a card is holding',
+        Math.abs(rel.waypoints[0].y - corner.y) < 0.01 &&
+        Math.abs(rel.waypoints[1].y - geometry.routeRelationship(rel, 0, 1).end.y) < 0.01,
+        JSON.stringify(rel.waypoints));
+
+      const after = geometry.routeRelationship(rel, 0, 1);
+
+      check('the line has the same number of bends it started with - none were added',
+        after.corners.length === 2, String(after.corners.length));
+      check('and both ends are still on their own columns',
+        after.start.y === route.start.y && after.end.y === route.end.y);
+      check('and it is one undoable step', state.canUndo());
+
+      state.undo();
+      check('undo puts the automatic route back',
+        (state.relationshipById('r-handle').waypoints || []).length === 0);
+    }
+
+    // ---- a leg dragged hard at the card it ends on
+    {
+      const rel = build('Hard against the card');
+      const route = geometry.routeRelationship(rel, 0, 1);
+      const reach = route.end.x - route.corners[1].x;
+
+      check('the fixture has a leg that can be dragged onto the far card', reach > 40,
+        String(reach));
+
+      drag(rel, 1, reach + 5, 0);
+
+      const after = geometry.routeRelationship(rel, 0, 1);
+
+      check('the leg stops short of the card rather than collapsing onto it',
+        after.corners.length === route.corners.length,
+        route.corners.length + ' -> ' + after.corners.length + ' ' + shape(after.points));
+      check('and the last leg still has some length to it',
+        Math.abs(after.points[after.points.length - 1].x -
+          after.points[after.points.length - 2].x) >= 11.99,
+        shape(after.points));
+
+      // The same at the other end: a route drawn right to left starts at the card's own x, so the
+      // first leg is the one that collapses.
+      const doc = state.state.doc;
+      const backwards = build('Right to left');
+      state.tableById('h-left').x = 700;
+      state.tableById('h-right').x = 0;
+      geometry.invalidateSizes();
+      state.selectOnly('relationships', backwards.id);
+      render.render();
+
+      const other = geometry.routeRelationship(backwards, 0, 1);
+      drag(backwards, 0, other.start.x - other.corners[0].x - 5, 0);
+
+      const settled = geometry.routeRelationship(backwards, 0, 1);
+      check('and a route drawn the other way round keeps its first leg too',
+        settled.corners.length === other.corners.length &&
+        Math.abs(settled.points[0].x - settled.points[1].x) >= 11.99,
+        shape(settled.points));
+    }
+
+    // ---- three points in a line are one leg, not two
+    {
+      // A run of points sharing a coordinate is a single leg with a redundant point on it. Moving
+      // two of the three would bend it - and if one of the three is an anchor, moving any of them
+      // takes an end off the column it points at and the router turns a new bend to get back.
+      const rel = build('A run');
+      const route = geometry.routeRelationship(rel, 0, 1);
+
+      rel.waypoints = [
+        { x: route.start.x + 110, y: route.start.y },
+        { x: route.start.x + 70, y: route.start.y },
+        { x: route.start.x + 210, y: route.start.y }
+      ];
+
+      state.selectOnly('relationships', rel.id);
+      render.render();
+
+      const run = geometry.routeRelationship(rel, 0, 1);
+      const middle = run.corners.findIndex(corner =>
+        Math.abs(corner.x - (route.start.x + 70)) < 0.01);
+
+      check('the fixture really is a run along the anchor\'s own row', middle > 0,
+        shape(run.points));
+      check('a point on a run that reaches an anchor cannot be moved across it',
+        !run.corners[middle].carryY, JSON.stringify(run.corners[middle]));
+      check('nor along it, so it has no handle and cannot bend the line at all',
+        !run.corners[middle].carryX && !handleFor(rel.id, middle),
+        JSON.stringify(run.corners[middle]));
+
+      // The same run, clear of both anchors: now the whole of it moves, and all of it together.
+      rel.waypoints = [
+        { x: route.start.x + 60, y: route.start.y },
+        { x: route.start.x + 60, y: route.start.y + 90 },
+        { x: route.start.x + 160, y: route.start.y + 90 },
+        { x: route.start.x + 120, y: route.start.y + 90 },
+        { x: route.start.x + 240, y: route.start.y + 90 }
+      ];
+
+      state.selectOnly('relationships', rel.id);
+      render.render();
+
+      const clear = geometry.routeRelationship(rel, 0, 1);
+      const inner = clear.corners.findIndex(corner =>
+        Math.abs(corner.x - (route.start.x + 120)) < 0.01);
+
+      check('a point on a run clear of both anchors moves across it', inner > 0 &&
+        !!clear.corners[inner].carryY, JSON.stringify(clear.corners[inner]));
+      check('and carries every other point on that run with it - all three of them',
+        clear.corners[inner].carryY.length === 3,
+        JSON.stringify(clear.corners[inner].carryY));
+
+      const wasBends = clear.corners.length;
+      drag(rel, inner, 0, 80);
+
+      check('so dragging it adds no bend to the line',
+        geometry.routeRelationship(rel, 0, 1).corners.length <= wasBends,
+        wasBends + ' -> ' + geometry.routeRelationship(rel, 0, 1).corners.length);
+
+      rel.waypoints = [];
+    }
+
+    // ---- a corner with a corner on each side of it moves both ways
+    {
+      // A cross offset gives the stepped shape: a short leg out of each card, then the middle of
+      // the route carried across. The corners in the middle of that have a corner on either side
+      // rather than a card, so both of their legs can move.
+      const rel = build('Both ways', { routeOffset: 30, routeOffsetCross: 90 });
+      const route = geometry.routeRelationship(rel, 0, 1);
+      const free = route.corners.findIndex(corner => corner.carryX && corner.carryY);
+
+      check('the fixture has a corner with a corner on both sides of it', free > 0,
+        JSON.stringify(route.corners.map(c => [c.carryX, c.carryY])));
+
+      const corner = route.corners[free];
+      const neighbours = route.corners.map(c => ({ x: c.x, y: c.y }));
+
+      drag(rel, free, 40, 40);
+
+      const after = geometry.routeRelationship(rel, 0, 1);
+
+      check('it moves on both axes', Math.abs(after.corners[free].x - (corner.x + 40)) <= 2.01 &&
+        Math.abs(after.corners[free].y - (corner.y + 40)) <= 2.01,
+        JSON.stringify(after.corners[free]));
+      check('and still adds no bend to the line',
+        after.corners.length === route.corners.length,
+        route.corners.length + ' -> ' + after.corners.length);
+      check('and each leg carried exactly one neighbour with it',
+        after.corners.filter((entry, at) =>
+          Math.abs(entry.x - neighbours[at].x) > 0.01 ||
+          Math.abs(entry.y - neighbours[at].y) > 0.01).length === 3,
+        JSON.stringify(after.corners.map((c, at) =>
+          Math.round(c.x - neighbours[at].x) + ',' + Math.round(c.y - neighbours[at].y))));
+      check('every leg is still horizontal or vertical',
+        diagonals(after.points).length === 0, shape(after.points));
+    }
+
+    // ---- a corner held at both ends has no handle at all
+    {
+      const rel = build('Nothing to move');
+      const route = geometry.routeRelationship(rel, 0, 1);
+
+      // A corner whose legs both end at a card cannot move either of them. A handle there would be
+      // a control that does nothing, so there is not one.
+      rel.waypoints = [{ x: route.end.x, y: route.start.y }];
+      state.selectOnly('relationships', rel.id);
+      render.render();
+
+      const only = geometry.routeRelationship(rel, 0, 1);
+
+      check('the fixture really is a route with one corner between the two cards',
+        only.corners.length === 1, String(only.corners.length));
+      check('a corner with a card at both ends of it can move neither leg',
+        !only.corners[0].carryX && !only.corners[0].carryY,
+        JSON.stringify(only.corners[0]));
+      check('and is given no handle', !handleFor(rel.id, 0));
+
+      // The drag refuses it as well, which no click can reach while the handle is not drawn - but
+      // a handle is drawn from the route at the time of the *render*, and anything that repaints
+      // between the draw and the press can take its freedom away. A source check, honestly.
+      const interactSource = (await import('node:fs')).readFileSync(
+        '../../src/Oliver4.DataverseModelDesigner/Web/js/interact.js', 'utf8');
+
+      check('and a press on a stale handle for one starts no drag',
+        /if \(!corner\.carryX && !corner\.carryY\) return null;/.test(interactSource));
+
+      rel.waypoints = [];
+    }
+
+    // ---- taking a bend out
+    {
+      const rel = build('Remove a bend', { routeOffset: 30, routeOffsetCross: 90 });
+      const route = geometry.routeRelationship(rel, 0, 1);
+
+      check('the fixture is a stepped route with bends to spare', route.corners.length >= 4,
+        String(route.corners.length));
+
+      const removable = route.corners
+        .map((corner, at) => geometry.cornersWithout(rel, 0, 1, at) === null ? null : at)
+        .filter(at => at !== null);
+
+      check('some of its bends can be taken out', removable.length > 0,
+        JSON.stringify(removable));
+
+      const reduced = geometry.cornersWithout(rel, 0, 1, removable[0]);
+      rel.waypoints = reduced;
+      rel.routeOffset = 0;
+      rel.routeOffsetCross = 0;
+
+      const after = geometry.routeRelationship(rel, 0, 1);
+
+      check('and taking one out leaves the line with fewer bends',
+        after.corners.length < route.corners.length,
+        route.corners.length + ' -> ' + after.corners.length);
+      check('while both ends stay on their columns',
+        after.start.y === route.start.y && after.end.y === route.end.y);
+      check('and every leg is still horizontal or vertical',
+        diagonals(after.points).length === 0, shape(after.points));
+    }
+
+    // ---- the bends that cannot go are not offered
+    {
+      const rel = build('Structural');
+      const route = geometry.routeRelationship(rel, 0, 1);
+
+      // Out of one card's side and into another's at a different height: the line has to turn
+      // twice and no route exists with fewer, so taking either corner out only puts it back
+      // somewhere else. Offered, the menu item would appear to do nothing.
+      check('neither corner of the plain two-bend route can be taken out',
+        geometry.cornersWithout(rel, 0, 1, 0) === null &&
+        geometry.cornersWithout(rel, 0, 1, 1) === null);
+
+      check('and an index that is not a corner is refused too',
+        geometry.cornersWithout(rel, 0, 1, 7) === null &&
+        geometry.cornersWithout(rel, 0, 1, -1) === null);
+
+      // Null is what the menu hands it when the right-click did not land on a handle at all, and
+      // null is neither less than zero nor past the end: unguarded it fell through to the pairs,
+      // where [null, 1] quietly means "take corner 1 out".
+      const noIndex = build('Null index', { routeOffset: 30, routeOffsetCross: 90 });
+      check('and so is no index at all',
+        geometry.cornersWithout(noIndex, 0, 1, null) === null &&
+        geometry.cornersWithout(noIndex, 0, 1, undefined) === null &&
+        geometry.cornersWithout(noIndex, 0, 1, 1.5) === null);
+
+      // The check above passes on every fixture I can build even without the guard, because null
+      // survives the range test and then falls through to a pair that removes a corner which was
+      // not going to reduce the line anyway. So the guard itself is pinned in the source: it is one
+      // router change away from being the difference between refusing and removing corner 1.
+      const geometrySource = (await import('node:fs')).readFileSync(
+        '../../src/Oliver4.DataverseModelDesigner/Web/js/geometry.js', 'utf8');
+
+      check('and the index is required to be a whole number, not merely in range',
+        /if \(!Number\.isInteger\(index\) \|\| index < 0/.test(geometrySource));
+
+      // Taking the last bend anybody moved out hands the connector back to following its cards,
+      // rather than leaving it carrying a list that draws the automatic route anyway.
+      const stepped = build('Back to automatic', { routeOffset: 30, routeOffsetCross: 90 });
+      const shape0 = shape(geometry.routeRelationship(stepped, 0, 1).points);
+      stepped.waypoints = geometry.routeRelationship(stepped, 0, 1).corners
+        .map(corner => ({ x: corner.x, y: corner.y }));
+
+      check('the baked corners draw the same line the offsets did',
+        shape(geometry.routeRelationship(stepped, 0, 1).points) === shape0);
+    }
+
+    // ---- Shift, and the right-click menu, take the bend out
+    {
+      const rel = build('Shift removes', { routeOffset: 30, routeOffsetCross: 90 });
+      const route = geometry.routeRelationship(rel, 0, 1);
+      const spare = route.corners.findIndex((corner, at) =>
+        geometry.cornersWithout(rel, 0, 1, at) !== null);
+
+      check('the fixture has a bend that can go', spare >= 0, String(spare));
+
+      drag(rel, spare, 40, 40, { shiftKey: true });
+
+      const after = geometry.routeRelationship(rel, 0, 1);
+
+      check('Shift while dragging a corner takes that bend out instead of moving it',
+        after.corners.length < route.corners.length,
+        route.corners.length + ' -> ' + after.corners.length);
+      check('and it is one undoable step', state.canUndo());
+
+      check('and clears the two offsets the corners now carry, as the menu item does',
+        (rel.waypoints || []).length && !rel.routeOffset && !rel.routeOffsetCross,
+        rel.routeOffset + ' / ' + rel.routeOffsetCross);
+
+      state.undo();
+      check('undo puts the bend back',
+        geometry.routeRelationship(state.relationshipById('r-handle'), 0, 1).corners.length ===
+          route.corners.length);
+
+      // The same gesture on a bend the route cannot do without leaves it exactly where it is.
+      const plain = build('Shift on a structural bend');
+      const was = state.canUndo();
+      drag(plain, 0, 40, 40, { shiftKey: true });
+
+      check('Shift on a bend that cannot go does nothing at all',
+        (plain.waypoints || []).length === 0 && !plain.routeOffset, JSON.stringify(plain.waypoints));
+      check('and writes no undo step', state.canUndo() === was);
+    }
+
+    // ---- Shift-click, with no drag at all
+    {
+      const rel = build('Shift click', { routeOffset: 30, routeOffsetCross: 90 });
+      const route = geometry.routeRelationship(rel, 0, 1);
+      const spare = route.corners.findIndex((corner, at) =>
+        geometry.cornersWithout(rel, 0, 1, at) !== null);
+
+      const at = interactions.toScreen(route.corners[spare].x, route.corners[spare].y);
+      const handle = handleFor(rel.id, spare);
+
+      pointer('pointerdown', at.x, at.y, { target: handle, shiftKey: true });
+      pointer('pointerup', at.x, at.y, { target: handle, shiftKey: true });
+
+      check('Shift-clicking a bend that can go takes it out without a drag',
+        geometry.routeRelationship(rel, 0, 1).corners.length < route.corners.length,
+        JSON.stringify(rel.waypoints));
+
+      // On a bend that cannot go, the gesture the user is making is the ordinary one of taking the
+      // connector out of a selection - which is what it would have been a few pixels further along
+      // the same line.
+      const plain = build('Shift click structural');
+      const spot = interactions.toScreen(
+        geometry.routeRelationship(plain, 0, 1).corners[0].x,
+        geometry.routeRelationship(plain, 0, 1).corners[0].y);
+
+      check('the fixture starts with the connector selected',
+        state.state.selection.relationships.has(plain.id));
+
+      pointer('pointerdown', spot.x, spot.y, { target: handleFor(plain.id, 0), shiftKey: true });
+      pointer('pointerup', spot.x, spot.y, { target: handleFor(plain.id, 0), shiftKey: true });
+
+      check('Shift-clicking one that cannot takes the line out of the selection instead',
+        !state.state.selection.relationships.has(plain.id));
+
+      state.selectOnly('relationships', plain.id);
+      render.render();
+
+      const again = interactions.toScreen(
+        geometry.routeRelationship(plain, 0, 1).corners[0].x,
+        geometry.routeRelationship(plain, 0, 1).corners[0].y);
+
+      // Ctrl deliberately does not. It is the fine-adjustment modifier for this very drag, and the
+      // guide says so, so a press with it held has to stay with the corner.
+      pointer('pointerdown', again.x, again.y, { target: handleFor(plain.id, 0), ctrlKey: true });
+      pointer('pointerup', again.x, again.y, { target: handleFor(plain.id, 0), ctrlKey: true });
+
+      check('and Ctrl-clicking leaves the selection alone, because Ctrl is fine adjustment',
+        state.state.selection.relationships.has(plain.id));
+      check('and neither wrote any routing',
+        (plain.waypoints || []).length === 0 && !plain.routeOffset);
+    }
+
+    // ---- the menu belongs to the connector the handle belongs to
+    {
+      const doc = fresh('Two lines');
+
+      const left = card('p-left', 'account', 'Account');
+      const right = card('p-right', 'contact', 'Contact', [
+        column('p-a', 'parentcustomerid', 'Customer', { isLookup: true, targets: ['account'] }),
+        column('p-b', 'cs_secondary', 'Secondary', { isLookup: true, targets: ['account'] })
+      ]);
+      left.x = 0; left.y = 0;
+      right.x = 600; right.y = 220;
+      doc.tables.push(left, right);
+      doc.settings.fieldDetail = 'AllFields';
+
+      const one = link('r-one', left.id, right.id,
+        { referencedAttribute: 'accountid', referencingAttribute: 'parentcustomerid' });
+      const two = link('r-two', left.id, right.id,
+        { referencedAttribute: 'accountid', referencingAttribute: 'cs_secondary' });
+      doc.relationships.push(one, two);
+      geometry.invalidateSizes();
+
+      // Zoomed out, which is where this feature is used. The hit test's tolerance is in world
+      // units, so at 0.35x it is wide enough to swallow the connector next door - and the handle's
+      // own connector is the only one that can be right.
+      state.state.view = { zoom: 0.35, panX: 0, panY: 0 };
+      state.selectOnly('relationships', two.id);
+      render.render();
+
+      const route = geometry.routeRelationship(two, 1, 2);
+      const handle = handleFor(two.id, 0);
+
+      check('the fixture draws a handle for the second of two parallel connectors', !!handle);
+
+      let menuFor = null;
+      interactions.initInteractions({
+        onSelectionChange: () => {}, onOpenEditor: () => {}, onConnect: () => {},
+        onAnnotationPlaced: () => {},
+        onContextMenu: (event, hit) => { menuFor = hit; }
+      });
+
+      const at = interactions.toScreen(route.corners[0].x, route.corners[0].y);
+      const menuEvent = {
+        type: 'contextmenu', clientX: at.x, clientY: at.y,
+        target: handle || nowhere,
+        preventDefault() {}, stopPropagation() {}
+      };
+
+      for (const handler of new Set(canvasNode.listeners.contextmenu || [])) handler(menuEvent);
+
+      check('right-clicking its handle opens the menu for that connector, not the one beside it',
+        menuFor && menuFor.id === two.id, JSON.stringify(menuFor));
+      check('and leaves it selected rather than swapping the selection',
+        state.state.selection.relationships.has(two.id));
+
+      state.state.view = { zoom: 1, panX: 0, panY: 0 };
+      interactions.initInteractions({
+        onSelectionChange: () => {}, onContextMenu: () => {}, onOpenEditor: () => {},
+        onConnect: () => {}, onAnnotationPlaced: () => {}
+      });
+    }
+
+    // ---- the menu item, and the command behind it
+    {
+      const appSource = (await import('node:fs')).readFileSync(
+        '../../src/Oliver4.DataverseModelDesigner/Web/js/app.js', 'utf8');
+
+      check('the connector menu offers to remove a bend',
+        /text: 'Remove this bend'/.test(appSource) && /function removeBend\(/.test(appSource));
+      check('and only when that bend can go',
+        /bend !== null\n\s*\? \{ text: 'Remove this bend'/.test(appSource));
+      check('and only for a handle belonging to the connector whose menu it is',
+        /if \(handle\.getAttribute\('data-id'\) !== relationshipId\) return null;/.test(appSource));
+      check('and the answer is worked out once, not once per closure',
+        /const bend = bendUnderPointer\(event, relationshipId\);/.test(appSource) &&
+        (appSource.match(/bendUnderPointer\(/g) || []).length === 2);
+      check('and the command asks the router the same question before it writes anything',
+        /const reduced = cornersWithout\([\s\S]{0,120}if \(reduced === null\) return;/.test(appSource));
+      check('and clears the two offsets, which the corners now carry',
+        /mutate\('remove bend'[\s\S]{0,700}relationship\.routeOffset = 0;/.test(appSource));
+      check('straightening a connector still clears the corners as well as the offsets',
+        /mutate\('straighten connector'[\s\S]{0,400}relationship\.waypoints = \[\];/.test(appSource));
+      check('and the menu item is offered for a connector whose corners were moved',
+        /function handRouted\([\s\S]{0,300}relationship\.waypoints\) && relationship\.waypoints\.length/.test(appSource));
+    }
+
+    // ---- a handle is a control of the selection, like every other grip
+    {
+      const rel = build('Unselected');
+      check('a selected connector has handles', !!handleFor(rel.id, 0));
+
+      state.clearSelection();
+      render.render();
+
+      check('and a connector nobody has selected has none', !handleFor(rel.id, 0));
+
+      // A path highlight fades everything that is not on the path back to 45%, connectors included.
+      // Drawn inside the connector's own group the handles inherited that; in the overlay they do
+      // not, so a faded line kept full-strength handles standing on it.
+      state.selectOnly('relationships', rel.id);
+      state.state.highlightPath = { tables: new Set(), relationships: new Set() };
+      render.render();
+
+      check('nor one the current path highlight has faded back', !handleFor(rel.id, 0));
+
+      state.state.highlightPath = null;
+      render.render();
+      check('and they come back when the highlight goes', !!handleFor(rel.id, 0));
+    }
+
+    // ---- the handles are screen-sized, not diagram-sized
+    {
+      const rel = build('Zoomed out');
+      const route = geometry.routeRelationship(rel, 0, 1);
+
+      const full = Number(handleFor(rel.id, 0).getAttribute('width'));
+
+      state.state.view = { zoom: 0.25, panX: 0, panY: 0 };
+      render.render();
+      const small = Number(handleFor(rel.id, 0).getAttribute('width'));
+
+      check('the corner target grows as the canvas shrinks, so it stays the same size on screen',
+        Math.abs(small * 0.25 - full) < 0.5, full + ' at 100%, ' + small + ' at 25%');
+      check('and the handle is still on the corner it belongs to',
+        Math.abs(Number(handleFor(rel.id, 0).getAttribute('x')) + small / 2 - route.corners[0].x) < 0.6);
+
+      // The cursor says which way this one goes, because a corner beside a card goes one way only
+      // and a handle that ignores half of every drag has to say so before the drag, not during it.
+      check('and its cursor says which way it can be dragged',
+        /ew-resize/.test(handleFor(rel.id, 0).getAttribute('style')),
+        handleFor(rel.id, 0).getAttribute('style'));
+
+      state.state.view = { zoom: 1, panX: 0, panY: 0 };
+    }
+
+    // ---- the snap
+    {
+      const rel = build('Snap');
+      const { corner } = drag(rel, 0, 30, 0);
+
+      // Snapped like a card is: the position lands on the grid, whatever the corner's own offset
+      // from it was when it was picked up. Rounding the distance travelled instead would carry that
+      // offset forever, and two corners that started out of step could never be lined up.
+      check('a corner drag puts the leg on the four-unit grid, wherever it started',
+        rel.waypoints[0].x % 4 === 0 && rel.waypoints[1].x % 4 === 0,
+        'from ' + corner.x + ' -> ' + JSON.stringify(rel.waypoints));
+      check('and within half a step of where the pointer left it',
+        Math.abs(rel.waypoints[0].x - (corner.x + 30)) <= 2.01, JSON.stringify(rel.waypoints[0]));
+
+      const fine = build('Fine');
+      const grabbed = drag(fine, 0, 30, 0, { ctrlKey: true });
+
+      check('and Ctrl takes it down to a single unit, like every other drag on this canvas',
+        Math.abs(fine.waypoints[0].x - (grabbed.corner.x + 30)) <= 0.51 &&
+        fine.waypoints[0].x % 1 === 0,
+        'from ' + grabbed.corner.x + ' -> ' + JSON.stringify(fine.waypoints[0]));
+
+      // Three screen pixels makes a drag; at anything above about 1.3x zoom that is less than half
+      // a snap, so the gesture travelled and the corner did not. Committing it pinned the whole
+      // route to the shape it already had: nothing to see, an undo step that undid nothing, and a
+      // connector that had quietly stopped following its cards.
+      const rel2 = build('Slip');
+      state.state.view = { zoom: 2, panX: 0, panY: 0 };
+      render.render();
+
+      const slipRoute = geometry.routeRelationship(rel2, 0, 1);
+      const slipAt = interactions.toScreen(slipRoute.corners[0].x, slipRoute.corners[0].y);
+      const before = state.canUndo();
+
+      pointer('pointerdown', slipAt.x, slipAt.y, { target: handleFor(rel2.id, 0) });
+      pointer('pointermove', slipAt.x + 3, slipAt.y + 1, { target: handleFor(rel2.id, 0) });
+      pointer('pointerup', slipAt.x + 3, slipAt.y + 1, { target: handleFor(rel2.id, 0) });
+
+      check('a slip too small to move a corner leaves the connector automatic',
+        (rel2.waypoints || []).length === 0 && !rel2.routeOffset && !rel2.routeOffsetCross,
+        JSON.stringify(rel2.waypoints));
+      check('and writes no undo step', state.canUndo() === before);
+
+      // The same slip on a connector that is *already* hand-routed. The guard above only covers an
+      // untouched one; here the drag bakes the whole drawn route and writes it back unchanged, so
+      // the line looked identical while the file was marked unsaved and an undo step went on the
+      // stack that undid nothing.
+      rel2.waypoints = [{ x: 300, y: 40 }];
+      state.selectOnly('relationships', rel2.id);
+      render.render();
+
+      const routed = geometry.routeRelationship(rel2, 0, 1);
+      const held = routed.corners.findIndex(corner => corner.carryX || corner.carryY);
+      const spot = interactions.toScreen(routed.corners[held].x, routed.corners[held].y);
+      const steps = state.canUndo();
+
+      pointer('pointerdown', spot.x, spot.y, { target: handleFor(rel2.id, held) });
+      pointer('pointermove', spot.x + 3, spot.y + 1, { target: handleFor(rel2.id, held) });
+      pointer('pointerup', spot.x + 3, spot.y + 1, { target: handleFor(rel2.id, held) });
+
+      check('and a slip on a corner of a hand-routed line leaves its corners alone',
+        rel2.waypoints.length === 1 && Math.abs(rel2.waypoints[0].x - 300) < 0.01,
+        JSON.stringify(rel2.waypoints));
+      check('and writes no undo step for that either', state.canUndo() === steps);
+
+      // The same slip on a line that is already hand-routed, where the body drag moves the shape.
+      rel2.waypoints = [{ x: 300, y: 40 }];
+      state.state.view = { zoom: 2, panX: 0, panY: 0 };
+      state.selectOnly('relationships', rel2.id);
+      render.render();
+
+      const body = interactions.toScreen(
+        geometry.routeRelationship(rel2, 0, 1).label.x,
+        geometry.routeRelationship(rel2, 0, 1).label.y);
+
+      pointer('pointerdown', body.x, body.y);
+      pointer('pointermove', body.x + 3, body.y + 1);
+      pointer('pointerup', body.x + 3, body.y + 1);
+
+      check('and a slip on the line itself moves nothing and writes no undo step either',
+        Math.abs(rel2.waypoints[0].x - 300) < 0.01 && state.canUndo() === before,
+        JSON.stringify(rel2.waypoints));
+
+      state.state.view = { zoom: 1, panX: 0, panY: 0 };
+    }
+
+    // ---- dragging the line itself, on a route that has been shaped by hand
+    //
+    // David, on seeing the first cut: "on the one vertical line it dynamically resizes it based on
+    // where I move the line, but on the other vertical line it keeps the height it previously was
+    // so it just moves the line down and creates an additional anchor. It looks odd and you would
+    // never want it to look like that." Carrying every corner at once moved the middle of the route
+    // away from two ends that cannot follow it, and the router reconnected the two ends
+    // differently: one extra leg merged into the leg already there, the other overshot and came
+    // back as a stub hanging off the line.
+    {
+      const rel = build('Drag the line');
+
+      // The shape from his screenshot: out of the first card, down, then a long run into the
+      // second. Both corners are his - he had dragged one before grabbing the line.
+      const auto = geometry.routeRelationship(rel, 0, 1);
+      rel.waypoints = auto.corners.map(corner => ({ x: corner.x, y: corner.y }));
+      state.selectOnly('relationships', rel.id);
+      render.render();
+
+      const route = geometry.routeRelationship(rel, 0, 1);
+      const long = route.points.length - 2;   // the last leg, into the card
+      const grab = interactions.toScreen(
+        (route.points[long].x + route.points[long + 1].x) / 2, route.points[long].y);
+
+      pointer('pointerdown', grab.x, grab.y);
+      pointer('pointermove', grab.x, grab.y + 60);
+      pointer('pointerup', grab.x, grab.y + 60);
+
+      const after = geometry.routeRelationship(rel, 0, 1);
+
+      check('dragging a leg of a hand-routed line moves that leg',
+        after.points.some(point => Math.abs(point.y - (route.points[long].y + 60)) < 0.01),
+        shape(after.points));
+
+      // The whole complaint, in one check. A point in line with its two neighbours but not between
+      // them is a leg that goes out and comes straight back - the stub in his screenshot.
+      const stubs = after.points.filter((point, at) => {
+        if (at === 0 || at === after.points.length - 1) return false;
+        const back = after.points[at - 1];
+        const on = after.points[at + 1];
+        return (Math.abs(back.x - point.x) < 0.01 && Math.abs(point.x - on.x) < 0.01 &&
+                (point.y < Math.min(back.y, on.y) - 0.01 || point.y > Math.max(back.y, on.y) + 0.01)) ||
+               (Math.abs(back.y - point.y) < 0.01 && Math.abs(point.y - on.y) < 0.01 &&
+                (point.x < Math.min(back.x, on.x) - 0.01 || point.x > Math.max(back.x, on.x) + 0.01));
+      });
+
+      check('and leaves no leg hanging off the route and coming back on itself',
+        stubs.length === 0, shape(after.points) + ' | ' + JSON.stringify(stubs));
+      check('both ends are still on their own columns',
+        after.start.y === route.start.y && after.end.y === route.end.y);
+      check('and every leg is still horizontal or vertical',
+        diagonals(after.points).length === 0, shape(after.points));
+
+      // The leg it was grabbed by ends on a card, so there is nothing there to stretch: the route
+      // is broken just clear of the card and the new corner carries that end. That is the "adds
+      // another break" he asked to keep.
+      check('a leg held at a card gains the break it needs to move',
+        after.corners.length > route.corners.length,
+        route.corners.length + ' -> ' + after.corners.length);
+
+      // And the break goes where a step belongs - beside the card - not wherever the router would
+      // have put a turn if it had been left to work the reconnection out for itself, which is
+      // halfway across the diagram.
+      const turn = after.points[after.points.length - 2];
+
+      check('and the break is made just clear of the card, not halfway across the diagram',
+        Math.abs(turn.y - after.end.y) < 0.01 && Math.abs(turn.x - after.end.x) <= 24,
+        'break at ' + turn.x + ',' + turn.y + ', card at ' + after.end.x + ',' + after.end.y);
+
+      // The same at the other end: the first leg out of the card has nothing behind it to stretch
+      // either.
+      const other = build('Drag the first leg');
+      const plain = geometry.routeRelationship(other, 0, 1);
+      other.waypoints = plain.corners.map(corner => ({ x: corner.x, y: corner.y }));
+      state.selectOnly('relationships', other.id);
+      render.render();
+
+      const head = geometry.routeRelationship(other, 0, 1);
+      const first = interactions.toScreen(
+        (head.points[0].x + head.points[1].x) / 2, head.points[0].y);
+
+      pointer('pointerdown', first.x, first.y);
+      pointer('pointermove', first.x, first.y - 70);
+      pointer('pointerup', first.x, first.y - 70);
+
+      const lifted = geometry.routeRelationship(other, 0, 1);
+      const away = lifted.points[1];
+
+      check('a first leg out of a card is broken beside that card too',
+        Math.abs(away.y - lifted.start.y) < 0.01 && Math.abs(away.x - lifted.start.x) <= 24,
+        'break at ' + away.x + ',' + away.y + ', card at ' + lifted.start.x + ',' + lifted.start.y +
+        ' ' + shape(lifted.points));
+      check('and the leg really did move to where the pointer left it',
+        lifted.points.some(point => Math.abs(point.y - (head.points[0].y - 70)) <= 2.01),
+        shape(lifted.points));
+      check('and that route has no stub on it either',
+        diagonals(lifted.points).length === 0, shape(lifted.points));
+
+      // The two offsets move the middle of an automatic shape, and there is no automatic shape left
+      // to move the middle of. Writing one as well would move the route twice.
+      check('and writes neither offset',
+        !rel.routeOffset && !rel.routeOffsetCross,
+        rel.routeOffset + ' / ' + rel.routeOffsetCross);
+
+      state.undo();
+      check('and undo puts the line back',
+        geometry.routeRelationship(state.relationshipById('r-handle'), 0, 1).corners.length ===
+          route.corners.length);
+
+      // A leg with a corner at each end has legs either side to stretch, so it moves with no break
+      // at all.
+      const inner = build('Inner leg', { routeOffset: 30, routeOffsetCross: 90 });
+      const stepped = geometry.routeRelationship(inner, 0, 1);
+      inner.waypoints = stepped.corners.map(corner => ({ x: corner.x, y: corner.y }));
+      state.selectOnly('relationships', inner.id);
+      render.render();
+
+      const middle = Math.floor(stepped.points.length / 2) - 1;
+      const held = interactions.toScreen(
+        (stepped.points[middle].x + stepped.points[middle + 1].x) / 2,
+        (stepped.points[middle].y + stepped.points[middle + 1].y) / 2);
+
+      pointer('pointerdown', held.x, held.y);
+      pointer('pointermove', held.x + 40, held.y + 40);
+      pointer('pointerup', held.x + 40, held.y + 40);
+
+      const settled = geometry.routeRelationship(inner, 0, 1);
+
+      check('a leg with a corner at each end moves without adding one',
+        settled.corners.length === stepped.corners.length,
+        stepped.corners.length + ' -> ' + settled.corners.length);
+      check('and every leg of it is still horizontal or vertical',
+        diagonals(settled.points).length === 0, shape(settled.points));
+
+      const hanging = settled.points.filter((point, at) => {
+        if (at === 0 || at === settled.points.length - 1) return false;
+        const back = settled.points[at - 1];
+        const on = settled.points[at + 1];
+        return (Math.abs(back.x - point.x) < 0.01 && Math.abs(point.x - on.x) < 0.01 &&
+                (point.y < Math.min(back.y, on.y) - 0.01 || point.y > Math.max(back.y, on.y) + 0.01)) ||
+               (Math.abs(back.y - point.y) < 0.01 && Math.abs(point.y - on.y) < 0.01 &&
+                (point.x < Math.min(back.x, on.x) - 0.01 || point.x > Math.max(back.x, on.x) + 0.01));
+      });
+
+      check('and nothing hangs off it and comes back on itself',
+        hanging.length === 0, shape(settled.points) + ' | ' + JSON.stringify(hanging));
+    }
+
+    // ---- a gesture that never finishes
+    {
+      const rel = build('Abandoned');
+      rel.waypoints = [{ x: 260, y: 40 }, { x: 260, y: 300 }];
+      render.render();
+
+      const grabCorner = () => {
+        state.selectOnly('relationships', rel.id);
+        render.render();
+
+        const route = geometry.routeRelationship(rel, 0, 1);
+        const index = route.corners.findIndex(corner => corner.carryX);
+        return {
+          at: interactions.toScreen(route.corners[index].x, route.corners[index].y),
+          handle: handleFor(rel.id, index)
+        };
+      };
+
+      let grab = grabCorner();
+      pointer('pointerdown', grab.at.x, grab.at.y, { target: grab.handle });
+      pointer('pointermove', grab.at.x + 80, grab.at.y, { target: grab.handle });
+      pointer('pointercancel', grab.at.x + 80, grab.at.y, { target: grab.handle });
+
+      check('a cancelled pointer puts the corner back rather than committing it',
+        Math.abs(rel.waypoints[0].x - 260) < 0.01, JSON.stringify(rel.waypoints));
+
+      grab = grabCorner();
+      pointer('pointerdown', grab.at.x, grab.at.y, { target: grab.handle });
+      pointer('pointermove', grab.at.x + 80, grab.at.y, { target: grab.handle });
+      window.dispatchEvent({
+        type: 'keydown', key: 'Escape', ctrlKey: false, metaKey: false, shiftKey: false,
+        target: { tagName: 'DIV' }, preventDefault() {}, stopPropagation() {}
+      });
+
+      check('Escape mid-drag puts the corner back',
+        Math.abs(rel.waypoints[0].x - 260) < 0.01, JSON.stringify(rel.waypoints));
+
+      pointer('pointerup', grab.at.x + 80, grab.at.y, { target: grab.handle });
+      check('and the release after it commits nothing',
+        Math.abs(rel.waypoints[0].x - 260) < 0.01, JSON.stringify(rel.waypoints));
+
+      // A second button going down on top of a drag in flight. Everything below overwrites the drag
+      // state, so without the abandon at the top of onPointerDown the corner stayed where it had
+      // been dragged to with no undo entry and the diagram not even marked unsaved.
+      grab = grabCorner();
+      pointer('pointerdown', grab.at.x, grab.at.y, { target: grab.handle });
+      pointer('pointermove', grab.at.x + 80, grab.at.y, { target: grab.handle });
+      pointer('pointerdown', grab.at.x + 80, grab.at.y, { button: 2 });
+      pointer('pointerup', grab.at.x + 80, grab.at.y, { button: 2 });
+
+      check('a second button pressed mid-drag puts the corner back too',
+        Math.abs(rel.waypoints[0].x - 260) < 0.01, JSON.stringify(rel.waypoints));
+    }
+
+    // ---- nothing here reaches an export
+    {
+      const rel = build('Export');
+      rel.waypoints = [{ x: 260, y: 40 }];
+      state.selectOnly('relationships', rel.id);
+      render.render();
+
+      check('the handles are on screen', serialiseLayer('layer-overlay').includes('data-corner'));
+      check('and not inside the connector\'s own group, under the cards',
+        !serialiseLayer('layer-links').includes('data-corner'));
+
+      const svgOut = render.buildExportSvg();
+      check('the export carries no corner handle', !svgOut.includes('data-corner'), svgOut.slice(0, 200));
+      check('nor the tooltip that describes the gesture',
+        !svgOut.includes('Drag to move') && !svgOut.includes('Drag left and right'));
+      check('and the hand-routed line itself is still drawn',
+        svgOut.includes('260') || svgOut.includes('path'));
+
+      // Source checks, and deliberately. The handles are drawn in the overlay layer, which the
+      // export never touches at all, so neither rule below can be reached by any document. They are
+      // there for the next hit target somebody adds without remembering that.
+      const renderSource = (await import('node:fs')).readFileSync(
+        '../../src/Oliver4.DataverseModelDesigner/Web/js/render.js', 'utf8');
+
+      check('and the export pass names the handle among the attributes it strips',
+        /removeAttribute\('data-corner'\)/.test(renderSource));
+      check('and among the tooltips it takes off a control',
+        /hasAttribute\('data-row-grip'\) \|\| node\.hasAttribute\('data-corner'\)/.test(renderSource));
+    }
+
+    // ---- a route shaped by hand does not survive the cards being rearranged
+    {
+      const rel = build('Rearranged');
+      rel.waypoints = [{ x: 300, y: 40 }];
+      rel.routeOffset = 20;
+
+      layout.applyLayout('Grid');
+
+      check('an auto-layout puts every connector back on its automatic route',
+        !(rel.waypoints || []).length && !rel.routeOffset && !rel.routeOffsetCross,
+        JSON.stringify(rel.waypoints) + ' ' + rel.routeOffset);
+
+      // Manual is "never move anything", so it must not take the routing either.
+      rel.waypoints = [{ x: 300, y: 40 }];
+      layout.applyLayout('Manual');
+
+      check('and Manual, which moves nothing, takes nothing',
+        (rel.waypoints || []).length === 1);
+    }
+
+    // ---- nor the two ends changing places
+    {
+      const rel = build('Swapped');
+      rel.waypoints = [{ x: 300, y: 40 }];
+
+      const wasFrom = rel.fromTableId;
+      rel.fromTableId = rel.toTableId;
+      rel.toTableId = wasFrom;
+      state.clearManualRoute(rel);
+
+      check('a connector re-pointed at different cards goes back to its automatic route',
+        !(rel.waypoints || []).length);
+
+      const inspectorSource = (await import('node:fs')).readFileSync(
+        '../../src/Oliver4.DataverseModelDesigner/Web/js/inspector.js', 'utf8');
+      const proposedSource = (await import('node:fs')).readFileSync(
+        '../../src/Oliver4.DataverseModelDesigner/Web/js/proposed.js', 'utf8');
+
+      check('and the inspector\'s two end pickers do it',
+        (inspectorSource.match(/clearManualRoute\(relationship\)/g) || []).length === 2);
+      check('and so do both proposed-relationship editors, but only when the ends change',
+        (proposedSource.match(/if \(repointed\) clearManualRoute\(/g) || []).length === 2);
+    }
+
+    // ---- the export dialog says which formats redraw the lines
+    {
+      const rel = build('Export warning');
+      rel.waypoints = [{ x: 300, y: 40 }];
+
+      const { collectWarnings } = await import(js + 'exporter.js');
+      const says = format => collectWarnings(format).some(line => /hand-routed/.test(line));
+
+      check('draw.io warns that it redraws a hand-routed connector', says('DrawIo'),
+        JSON.stringify(collectWarnings('DrawIo')));
+      check('and Visio does', says('Visio'));
+      check('and Mermaid does', says('Mermaid'));
+      check('and the picture formats, which honour it, do not',
+        !says('Png') && !says('Svg'));
+
+      state.clearManualRoute(rel);
+      check('and a diagram with no hand routing is told nothing about it', !says('DrawIo'));
+
+      // A connector taken off the canvas is not in the picture, so it is not in the count either.
+      rel.waypoints = [{ x: 300, y: 40 }];
+      rel.hidden = true;
+      check('nor is a hidden connector counted', !says('DrawIo'));
+      rel.hidden = false;
+    }
+
+    // ---- a step clear of a card lands outside it, not in the card opposite
+    {
+      const doc = fresh('Nearly touching');
+
+      const left = card('n-left', 'account', 'Account');
+      const right = card('n-right', 'contact', 'Contact', [
+        column('n-rightfk', 'parentcustomerid', 'Customer', { isLookup: true, targets: ['account'] })
+      ]);
+      doc.tables.push(left, right);
+      doc.settings.fieldDetail = 'RelationshipFields';
+
+      const rel = link('r-tight', left.id, right.id,
+        { referencedAttribute: 'accountid', referencingAttribute: 'parentcustomerid' });
+      doc.relationships.push(rel);
+      geometry.invalidateSizes();
+
+      // Two cards with less than the usual step between them, which is where an eighteen-unit step
+      // clear of one card lands inside the other and the connector is drawn across a table.
+      const width = geometry.tableRect(left).width;
+      left.x = 0; left.y = 0;
+      right.x = width + 14; right.y = 10;
+      geometry.invalidateSizes();
+
+      const auto = geometry.routeRelationship(rel, 0, 1);
+      const cards = [geometry.tableRect(left), geometry.tableRect(right)];
+
+      const crossesACard = points => geometry.segmentsOf(points).some(seg => cards.some(rect =>
+        Math.min(seg.a.x, seg.b.x) < rect.x + rect.width - 0.01 &&
+        Math.max(seg.a.x, seg.b.x) > rect.x + 0.01 &&
+        Math.min(seg.a.y, seg.b.y) < rect.y + rect.height - 0.01 &&
+        Math.max(seg.a.y, seg.b.y) > rect.y + 0.01));
+
+      rel.waypoints = [{ x: auto.start.x, y: auto.start.y - 100 }];
+      check('a corner on the start anchor\'s line does not step into the card opposite',
+        !crossesACard(geometry.routeRelationship(rel, 0, 1).points),
+        shape(geometry.routeRelationship(rel, 0, 1).points));
+
+      rel.waypoints = [{ x: auto.end.x, y: auto.end.y - 160 }];
+      check('nor does one on the end anchor\'s line',
+        !crossesACard(geometry.routeRelationship(rel, 0, 1).points),
+        shape(geometry.routeRelationship(rel, 0, 1).points));
+
+      rel.waypoints = [];
+    }
+
+    // ---- a guard no document reaches
+    {
+      const source = (await import('node:fs')).readFileSync(
+        '../../src/Oliver4.DataverseModelDesigner/Web/js/geometry.js', 'utf8');
+
+      // A source check on purpose. Taking a point out of the middle of a route can leave its two
+      // neighbours on top of each other, but it needs a pair of exact coincidences that no drag
+      // produces. It is there for the next shape somebody adds to the router.
+      check('tidy de-duplicates again after taking a point out of the middle',
+        /kept = dedupe\(kept\);/.test(source));
+    }
+
+    uiModule.closeModal();
+    state.clearSelection();
+    state.state.view = { zoom: 1, panX: 0, panY: 0 };
+  }
 }
 
 console.log('\nInterop with the C# document');
@@ -6656,6 +9328,25 @@ if (fs.existsSync('./interop-document.json')) {
       state.annotationKind(a) === 'arrow' && a.dx === -120 && a.dy === -80));
   check('a relationship-owned lookup column came through',
     state.state.doc.tables.some(t => (t.columns || []).some(c => c.fromRelationshipId)));
+
+  // 1.11.1. The host writes the file, so a corner the canvas placed only survives if it is on the
+  // host model too - and it only draws where the user put it if the two agree on the order.
+  {
+    const routed = state.state.doc.relationships.find(r => (r.waypoints || []).length);
+
+    check('the host\'s hand-placed connector corners came through, in order',
+      !!routed && routed.waypoints.length === 2 &&
+      Math.abs(routed.waypoints[0].x - 220.5) < 0.001 &&
+      Math.abs(routed.waypoints[1].y - 260.25) < 0.001,
+      JSON.stringify(routed && routed.waypoints));
+
+    if (routed) {
+      const route = geometry.routeRelationship(routed, 0, 1);
+      check('and the canvas routes through them rather than ignoring them',
+        !!route && route.manual === true &&
+        route.corners.filter(corner => corner.waypointIndex !== null).length === 2);
+    }
+  }
 
   render.render();
   const hostSvg = render.buildExportSvg();

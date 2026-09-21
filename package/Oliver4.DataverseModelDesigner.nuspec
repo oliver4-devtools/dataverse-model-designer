@@ -14,12 +14,12 @@
 
   Build:
      dotnet build src\Oliver4.DataverseModelDesigner -c Release
-     nuget pack package\Oliver4.DataverseModelDesigner.nuspec -Version 1.10.0
+     nuget pack package\Oliver4.DataverseModelDesigner.nuspec -Version 1.11.3
 -->
 <package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
   <metadata>
     <id>Oliver4.DataverseModelDesigner</id>
-    <version>1.10.0</version>
+    <version>1.11.3</version>
     <title>Dataverse Model Designer</title>
     <authors>Oliver4</authors>
     <owners>Oliver4</owners>
@@ -43,6 +43,101 @@
       The tool only ever reads metadata. Nothing it does changes the connected environment.
     </description>
     <releaseNotes>
+      1.11.3 - dragging a hand-routed line moves the leg you grabbed.
+
+      It used to carry every corner at once. Both ends of a connector stay on the columns they point
+      at whatever the middle does, so the route then had to be reconnected to two ends that had not
+      moved - and that came out differently at the two ends. At one, the extra leg ran the same way
+      as the leg already there and merged into it, which looked like the line stretching; at the
+      other it overshot and came back, leaving a stub hanging off the route with a handle on the end
+      of it and nothing to be done but remove the bend.
+
+      Dragging the line now moves the one leg you grabbed, across itself, and the legs either side
+      stretch to follow - the same thing dragging a corner does, grabbed by the leg instead of the
+      corner. A leg that ends on a card has nothing behind it to stretch, so the route is broken
+      just beside that card and the new corner carries that end: still the extra break, but put
+      where a step belongs rather than halfway across the diagram.
+
+      Dragging a connector nobody has shaped by hand is unchanged.
+
+      1.11.2 - a connector corner moves the legs it belongs to.
+
+      In 1.11.1 dragging a corner pulled the line out to wherever you put it and turned whatever
+      extra bends that took. It now moves the two legs that meet at the corner and nothing else, so
+      the line never gains a bend it did not have: drag the corner sideways and the leg running
+      across the route slides with it, taking the corner at its other end along, while the leg back
+      to the card simply stretches. A leg ending on a card cannot move - that end is sitting on the
+      column the relationship points at - so a corner next to a card slides one way only, and its
+      cursor says which way before you start. A corner with a card at both ends of it moves nothing
+      and is given no handle at all.
+
+      Right-click a corner for "Remove this bend", or hold Shift while dragging it. A bend is
+      usually a pair of corners, so the two either side are considered with it and whichever leaves
+      the fewest turns is what you get. Some bends cannot go - a line leaving one card's side and
+      arriving at another's at a different height has to turn twice - so the item is offered only
+      where the line can really do without it, and never appears to do nothing.
+
+      Ctrl while dragging is fine adjustment, otherwise corners land on a four-unit grid. Dragging
+      the line itself moves the whole shape. "Straighten this connector" is still the way back to
+      the automatic route.
+
+      1.11.1 - the corners of a connector can be moved one at a time.
+
+      Select a connector and every right angle on it gains a handle. Drag one and the two legs that
+      meet there move with it. Nothing else moves, and the line never gains a bend it did not have:
+      it is the existing legs that travel. A leg ending on a card cannot move - that end is sitting
+      on the column the relationship points at - so a corner next to a card slides one way only,
+      and its cursor says which way before you start. Ctrl while dragging is fine adjustment,
+      otherwise corners land on a four-unit grid.
+
+      Right-click a corner for "Remove this bend", or hold Shift while dragging it. Some bends
+      cannot go - a line leaving one card's side and arriving at another's at a different height has
+      to turn twice - so the item is offered only where the line can really do without it, and never
+      appears to do nothing. Dragging the line itself moves the whole shape. "Straighten this
+      connector" is still the way back to the automatic route.
+
+      The corners are kept in the diagram file, so a route shaped by hand is the route that opens
+      next time. An auto-layout, or a change to which two tables a relationship joins, puts the
+      connectors it affects back on their automatic routes - the corners were placed around cards
+      that have moved. The export dialog now says which formats redraw the lines for themselves.
+
+      1.11.0 - changes from real-world use of the tool.
+
+      A connector can now be dragged in both directions at once. The middle of the route follows
+      the pointer wherever it goes and the two ends stay on the columns they point at, so a line
+      can be taken out of a bundle of overlapping ones without changing what it says.
+
+      The fields on a card can be put in any order by hand. Select a card and each of its rows
+      gains a grip just outside the left edge; drag one and the field moves up or down the card,
+      taking the connectors anchored to it with it. The order is kept in the diagram file and the
+      exports draw the same order as the picture.
+
+      Two tables stacked one above the other now keep their connector on the lookup field. A line
+      meeting the top or bottom edge of a card could only point at the table, so a route between
+      stacked cards leaves through the side and runs down a lane beside them instead. A card
+      showing no columns has nothing to point at and keeps the straight run it always had.
+
+      The model list beside the canvas paints each table's mark in the emphasis colour applied to
+      that table, so the list, the cards and the legend agree. Its tooltip names the colour and the
+      table's status, because several emphasis colours are the same colour as a status.
+
+      Both of the new things have a way back on a right-click menu: "Straighten this connector"
+      puts a dragged route back to the one the canvas would give it, and "Reset column order on
+      this card" puts a reordered card back under the Column order setting.
+
+      Fixed: clicking a colour in the legend to name it did nothing. Dragging the legend, added in
+      1.8.0, took the pointer capture on every press, and while an element holds the capture the
+      browser sends the click to it rather than to the row inside it - so the rename dialog was
+      never opened.
+
+      Fixed, all found reviewing the above: a gesture interrupted part way - by pressing a second
+      button, by Escape, by Ctrl+Z, or by the browser taking the pointer away - left what it had
+      already moved where it was, with nothing to undo it and the diagram not even marked unsaved.
+      A connector dragged hard on a route running right to left, or upward, could be drawn through
+      the card it came out of. Two cards dropped on top of each other had every part of their
+      connector drawn inside them. One Escape now cancels an arrow being dragged out, rather than
+      taking two. The inspector's column list follows the order the card is actually in.
+
       1.10.0 - changes from real-world use of the tool.
 
       Depth now means the whole model. An annotation sent behind the tables goes behind the

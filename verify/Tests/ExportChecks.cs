@@ -86,8 +86,23 @@ namespace Oliver4.DataverseModelDesigner.Verification
             Check("warns about lost layout", mermaid.Warnings.Any(w => w.ToLowerInvariant().Contains("layout")));
 
             Section("Round trip through the diagram file");
-            // A connector the user has dragged clear of another one carries a manual offset.
+            // A connector the user has dragged clear of another one carries a manual offset - one
+            // per axis since 1.11.0, so the middle of a route can be moved anywhere on the canvas.
             document.Relationships[0].RouteOffset = 42.5;
+            document.Relationships[0].RouteOffsetCross = -18.25;
+
+            // And since 1.11.1 a connector whose corners the user moved one at a time carries the
+            // points the route has to pass through. This one is on a *different* relationship from
+            // the offsets above on purpose: the canvas zeroes both offsets the moment a corner is
+            // dragged, so a file carrying both on one connector is not a file the tool can write.
+            document.Relationships[1].Waypoints = new List<PointD>
+            {
+                new PointD { X = 220.5, Y = -40 },
+                new PointD { X = 380, Y = 260.25 }
+            };
+
+            // And a card whose rows the user dragged into an order carries that order.
+            document.Tables[0].ColumnOrder = new List<string> { "name", document.Tables[0].PrimaryIdAttribute };
             var json = DiagramFile.Serialize(document);
             var reloaded = DiagramFile.Deserialize(json);
             Check("tables survive", reloaded.Tables.Count == document.Tables.Count);
@@ -100,6 +115,27 @@ namespace Oliver4.DataverseModelDesigner.Verification
             Check("cascade survives", reloaded.Relationships.Any(r => r.Cascade != null && r.Cascade.Delete == "RemoveLink"));
             Check("display settings survive", reloaded.Settings.FieldDetail == document.Settings.FieldDetail);
             Check("highlight survives", reloaded.Tables.Any(t => t.Highlight == "#16a34a"));
+
+            // 1.11.0, both additive. A property the host model does not carry is dropped on the way
+            // through - the canvas posts the document back and the host is what writes the file -
+            // so a new canvas property that is not here is a setting the user cannot keep.
+            Check("both connector offsets survive",
+                Math.Abs(reloaded.Relationships[0].RouteOffset - 42.5) < 0.001 &&
+                Math.Abs(reloaded.Relationships[0].RouteOffsetCross + 18.25) < 0.001,
+                reloaded.Relationships[0].RouteOffset + " / " + reloaded.Relationships[0].RouteOffsetCross);
+            Check("hand-placed connector corners survive, in order",
+                reloaded.Relationships[1].Waypoints != null &&
+                reloaded.Relationships[1].Waypoints.Count == 2 &&
+                Math.Abs(reloaded.Relationships[1].Waypoints[0].X - 220.5) < 0.001 &&
+                Math.Abs(reloaded.Relationships[1].Waypoints[1].Y - 260.25) < 0.001,
+                string.Join(" ", (reloaded.Relationships[1].Waypoints ?? new List<PointD>())
+                    .Select(point => point.X + "," + point.Y)));
+
+            Check("a hand-made field order survives",
+                reloaded.Tables[0].ColumnOrder != null &&
+                reloaded.Tables[0].ColumnOrder.Count == 2 &&
+                reloaded.Tables[0].ColumnOrder[0] == "name",
+                string.Join(", ", reloaded.Tables[0].ColumnOrder ?? new List<string>()));
 
             // The name is what makes an emphasis colour mean anything to a second reader, so it
             // has to travel with the diagram rather than sit in a per-machine preference. Added in
@@ -280,6 +316,12 @@ namespace Oliver4.DataverseModelDesigner.Verification
 
             Section("1.10.0 - depth against the whole model, a turned note, one connection message");
             Run1100Checks();
+
+            Section("1.11.0 - the guards on a two-axis offset and a hand-made column order");
+            Run1110Checks();
+
+            Section("1.11.1 - the guards on a hand-routed connector's corners");
+            Run1111Checks();
 
             Section("Version format");
             Check("is three-part", System.Text.RegularExpressions.Regex.IsMatch(
@@ -929,6 +971,36 @@ namespace Oliver4.DataverseModelDesigner.Verification
                 ordered.FindIndex(c => c.IsLookup) < ordered.FindIndex(c => !c.IsPrimaryId && !c.IsLookup && !c.IsPrimaryName),
                 string.Join(", ", ordered.Select(c => c.LogicalName)));
 
+            // 1.11.0. A card whose rows the user dragged into an order is in that order in the
+            // exports too, ahead of the key float - the same rule `orderColumns` applies on the
+            // canvas. Without it the picture and the catalogue beside it disagree, which is the
+            // whole defect OrderColumns exists to fix.
+            rankProbe.ColumnOrder = new List<string> { "cs_plain", "cs_rankprobeid" };
+            var byHand = ExportRowBuilder.SelectedColumns(document, rankProbe).ToList();
+
+            Check("a hand-made field order beats the key float in the exports too",
+                byHand.Count > 1 && byHand[0].LogicalName == "cs_plain" && byHand[1].IsPrimaryId,
+                string.Join(", ", byHand.Select(c => c.LogicalName)));
+            Check("and a column the order has never heard of comes after the ones it has",
+                byHand.FindIndex(c => c.LogicalName == "cs_lookup") > 1 &&
+                byHand.FindIndex(c => c.LogicalName == "cs_name") > 1,
+                string.Join(", ", byHand.Select(c => c.LogicalName)));
+            Check("with the unlisted columns still in the order they would have had",
+                byHand.FindIndex(c => c.IsPrimaryName) < byHand.FindIndex(c => c.IsLookup),
+                string.Join(", ", byHand.Select(c => c.LogicalName)));
+
+            // The sort is by logical name and the canvas lower-cases every key it writes, so the
+            // two runtimes have to agree about case or a card ordered on screen comes out in
+            // metadata order in every document.
+            rankProbe.ColumnOrder = new List<string> { "CS_PLAIN" };
+            Check("the order is matched without regard to case",
+                ExportRowBuilder.SelectedColumns(document, rankProbe).First().LogicalName == "cs_plain",
+                ExportRowBuilder.SelectedColumns(document, rankProbe).First().LogicalName);
+
+            rankProbe.ColumnOrder = new List<string>();
+            Check("and an empty order leaves the ordinary rules alone",
+                ExportRowBuilder.SelectedColumns(document, rankProbe).First().IsPrimaryId);
+
             document.Tables.Remove(rankProbe);
 
             // Column order is a diagram setting that changed the canvas and no document at all,
@@ -1526,7 +1598,13 @@ namespace Oliver4.DataverseModelDesigner.Verification
                 FromTableId = account.Id,
                 ToTableId = segment.Id,
                 ReferencingAttribute = "cs_accountid",
-                Included = true
+                Included = true,
+
+                // 1.11.1. Routed by hand while it ran the other way round. The corners are absolute
+                // canvas coordinates placed around that shape, so a promotion that swaps the ends
+                // leaves the route visiting them backwards and drawing back over itself.
+                Waypoints = new List<PointD> { new PointD { X = 120, Y = 60 } },
+                RouteOffset = 40
             };
             document.Relationships.Add(link);
 
@@ -1567,6 +1645,10 @@ namespace Oliver4.DataverseModelDesigner.Verification
                     string.Equals(c.LogicalName, promotedLink.ReferencingAttribute, StringComparison.OrdinalIgnoreCase)),
                 manyEnd == null ? "(no card)" : promotedLink.ReferencingAttribute + " on " +
                     string.Join(", ", manyEnd.Columns.Select(c => c.LogicalName + (c.IsPrimaryId ? " (pk)" : string.Empty))));
+            Check("and takes the hand routing off, because the corners were placed the other way round",
+                promotedLink.Waypoints.Count == 0 && promotedLink.RouteOffset == 0 &&
+                promotedLink.RouteOffsetCross == 0,
+                promotedLink.Waypoints.Count + " corners, offset " + promotedLink.RouteOffset);
             Check("and never onto that card's own primary key",
                 manyEnd != null && !manyEnd.Columns.Any(c =>
                     c.IsPrimaryId &&
@@ -1786,6 +1868,157 @@ namespace Oliver4.DataverseModelDesigner.Verification
         /// order *within* a pass: sticky notes go out before text boxes and arrows, so a label
         /// lying on a note is not buried under the paper it labels.
         /// </summary>
+        /// <summary>
+        /// 1.11.0. Both new properties are numbers or lists that reach the canvas straight out of
+        /// the file, and neither can be given a meaningless value by any gesture in the tool - which
+        /// is exactly why a hand-edited or half-written file is the case worth guarding.
+        /// </summary>
+        /// <summary>
+        /// 1.11.1. A hand-placed corner is a point on the drawn route, so an unusable one reaches
+        /// documentBounds and hands Fit and every picture export a drawing with no finite extent -
+        /// exactly what an infinite offset does, and guarded exactly the same way. No gesture in
+        /// the tool can write one; a hand-edited or half-written file can.
+        /// </summary>
+        private static void Run1111Checks()
+        {
+            var document = new DiagramDocument { Title = "Corners" };
+            var table = Table("account", "Account", 0, 0);
+            var other = Table("contact", "Contact", 400, 0);
+            document.Tables.Add(table);
+            document.Tables.Add(other);
+
+            document.Relationships.Add(new DiagramRelationship
+            {
+                Id = "r-corners", SchemaName = "cs_corners", Kind = RelationshipKind.OneToMany,
+                FromTableId = table.Id, ToTableId = other.Id,
+                Waypoints = new List<PointD>
+                {
+                    new PointD { X = 100, Y = 50 },
+                    new PointD { X = 200, Y = 60 }
+                }
+            });
+
+            // Infinity is not a number JSON can carry, so only a hand edit puts one in a file:
+            // 1e400 is a literal too big for a double, which is what that edit looks like.
+            var handEdited = DiagramFile.Serialize(document)
+                .Replace("\"x\": 100", "\"x\": 1e400")
+                .Replace("\"y\": 60", "\"y\": -1e400");
+
+            var loaded = DiagramFile.Deserialize(handEdited);
+            var guarded = loaded.Relationships.Single(r => r.Id == "r-corners");
+
+            Check("a corner with an infinite coordinate is dropped on the way in",
+                guarded.Waypoints.Count == 0,
+                string.Join(" ", guarded.Waypoints.Select(point => point.X + "," + point.Y)));
+
+            // Only the bad ones. Dropping the lot would silently straighten a route the user had
+            // shaped, which is a bigger surprise than one corner going missing.
+            var oneBad = DiagramFile.Serialize(document).Replace("\"x\": 100", "\"x\": 1e400");
+            var partly = DiagramFile.Deserialize(oneBad).Relationships.Single(r => r.Id == "r-corners");
+
+            Check("and the corners either side of it are kept",
+                partly.Waypoints.Count == 1 && Math.Abs(partly.Waypoints[0].X - 200) < 0.001,
+                string.Join(" ", partly.Waypoints.Select(point => point.X + "," + point.Y)));
+
+            // Null is what a file written by any build before this one carries - the property was
+            // on the model but nothing ever wrote to it - and every other collection on the model
+            // is guarded the same way. A second connector with no corners of its own is what gives
+            // the edit an empty list to blank out: the one above is carrying two.
+            document.Relationships.Add(new DiagramRelationship
+            {
+                Id = "r-automatic", SchemaName = "cs_automatic", Kind = RelationshipKind.OneToMany,
+                FromTableId = other.Id, ToTableId = table.Id
+            });
+
+            var nulled = DiagramFile.Serialize(document).Replace("\"waypoints\": []", "\"waypoints\": null");
+            Check("the fixture really does carry a null corner list",
+                nulled.Contains("\"waypoints\": null"));
+
+            Check("a file with no corner list at all loads with an empty one",
+                DiagramFile.Deserialize(nulled).Relationships.All(r => r.Waypoints != null));
+
+            // Additive on both models, so the file format version does not move: an older build
+            // ignores the corners and draws the automatic route, which is the same picture this one
+            // draws with none of them.
+            var roundTripped = DiagramFile.Deserialize(DiagramFile.Serialize(document));
+            Check("hand-placed corners do not move the file format version",
+                roundTripped.FormatVersion == DiagramDocument.CurrentFormatVersion,
+                roundTripped.FormatVersion.ToString());
+        }
+
+        private static void Run1110Checks()
+        {
+            var document = new DiagramDocument { Title = "Guards" };
+            var table = Table("account", "Account", 0, 0);
+            var other = Table("contact", "Contact", 400, 0);
+            document.Tables.Add(table);
+            document.Tables.Add(other);
+
+            document.Relationships.Add(new DiagramRelationship
+            {
+                Id = "r-guard", SchemaName = "cs_guard", Kind = RelationshipKind.OneToMany,
+                FromTableId = table.Id, ToTableId = other.Id
+            });
+
+            // Written into the text rather than onto the model: infinity is not a number JSON can
+            // carry, so a serialiser cannot produce this file and only a hand edit can. 1e400 is
+            // what that hand edit looks like - a literal too big for a double, which is the one
+            // route an infinite value has into the document.
+            var handEdited = DiagramFile.Serialize(document)
+                .Replace("\"routeOffset\": 0", "\"routeOffset\": 1e400")
+                .Replace("\"routeOffsetCross\": 0", "\"routeOffsetCross\": -1e400");
+
+            var loaded = DiagramFile.Deserialize(handEdited);
+            var guarded = loaded.Relationships.Single(r => r.Id == "r-guard");
+
+            // An infinite offset is carried into the route's points, out of those into the drawing's
+            // bounds, and from there into Fit and every picture export as a drawing with no finite
+            // extent. The legend position has been guarded this way since 1.8.0.
+            Check("an infinite connector offset is cleared on the way in",
+                guarded.RouteOffset == 0, guarded.RouteOffset.ToString());
+            Check("and one across the route as well",
+                guarded.RouteOffsetCross == 0, guarded.RouteOffsetCross.ToString());
+
+            // Null is what a file written by any build before this one carries - the property did
+            // not exist - and every other collection on the model is guarded the same way. Written
+            // into the text because the stub serialiser in this harness does not reproduce a null
+            // list the way the real one does.
+            var nulled = DiagramFile.Serialize(document).Replace("\"columnOrder\": []", "\"columnOrder\": null");
+            Check("the fixture really does carry a null column order",
+                nulled.Contains("\"columnOrder\": null"));
+
+            var listed = DiagramFile.Deserialize(nulled);
+            Check("a file with no column order at all loads with an empty one",
+                listed.Tables.All(t => t.ColumnOrder != null));
+
+            // The canvas writes `logicalName || schemaName || id` and lower-cases it; the export
+            // used ?? , which only falls through on null. A column with an empty logical name and a
+            // schema name was therefore ordered on the canvas and left unordered in every document.
+            var probe = new DiagramTable
+            {
+                LogicalName = "cs_keyprobe", DisplayName = "Key probe", Status = ObjectStatus.Existing,
+                ColumnOrder = new List<string> { "cs_bySchema" },
+                Columns = new List<DiagramColumn>
+                {
+                    new DiagramColumn { LogicalName = "cs_first", DisplayName = "First", Selected = true },
+                    new DiagramColumn
+                    {
+                        LogicalName = string.Empty, SchemaName = "cs_bySchema",
+                        DisplayName = "Named by its schema name", Selected = true
+                    }
+                }
+            };
+
+            document.Tables.Add(probe);
+            document.Settings.FieldDetail = FieldDetailMode.AllFields;
+
+            var ordered = ExportRowBuilder.SelectedColumns(document, probe).ToList();
+
+            Check("a column with an empty logical name is ordered by its schema name",
+                ordered.Count == 2 && ordered[0].SchemaName == "cs_bySchema",
+                string.Join(", ", ordered.Select(c => c.LogicalName + "/" + c.SchemaName)));
+        }
+
         private static void Run1100Checks()
         {
             var document = new DiagramDocument { Title = "Depth and angle" };
